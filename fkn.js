@@ -1,0 +1,298 @@
+/* CRM Sistemi Dalessi — leitores dos arquivos do FKN (SIFWin), puros (sem tela).
+   Usados pela tela (Compras, Gestão) e pela Edge Function crm-notas, que os baixa do GitHub num
+   commit fixo junto com regras.js e nfe.js (o vigia manda os CSV salvos pelo FKN).
+   - Estoque: CSV simples (exp_estoque.csv) ou a Listagem cadastral de produtos (SIFN108).
+   - Contas a receber por cliente, em aberto (SIFN016).
+   - Contas a pagar por conta/fornecedor, em aberto (SIFN083) → Caixa (crm_fin_lancamentos).
+   Depois de mexer aqui: commit + push, node ferramentas/fixa-motor-notas.js e publicar a função. */
+(function (raiz) {
+  'use strict';
+  const R = raiz.CRMRegras || (typeof require !== 'undefined' ? require('./regras.js') : null);
+  const digitos = v => String(v == null ? '' : v).replace(/\D/g, '');
+  const doc = v => String(v == null ? '' : v).toUpperCase().replace(/[^0-9A-Z]/g, ''); // CPF/CNPJ (o CNPJ pode ter letras desde 07/2026)
+
+  // ------------------------------------------------------------ estoque (CSV do FKN)
+  // Cabeçalho reconhecido pelo nome (CODIGO; NOME DO PRODUTO; UNIDADE; LOCALIZAÇÃO; CUSTO; ESTOQUE).
+  // Código "010503.0" do FKN = "010503" da nota. CUSTO é o custo total do saldo.
+  function lerEstoque(texto) {
+    const linhas = R.csvParse(texto).filter(l => l.some(c => String(c == null ? '' : c).trim()));
+    if (linhas.length < 2) throw new Error('o arquivo está vazio');
+    const cab = linhas[0].map(c => R.normaliza(c));
+    const col = (...nomes) => { for (const n of nomes) { const i = cab.findIndex(c => c === n || c.startsWith(n + ' ')); if (i !== -1) return i; } return -1; };
+    const iCod = col('codigo', 'cod'), iDesc = col('nome do produto', 'descricao', 'produto', 'nome'), iUn = col('unidade', 'un'),
+      iLoc = col('localizacao', 'local'), iCusto = col('custo', 'custo total'), iQtd = col('estoque', 'saldo', 'quantidade', 'qtd');
+    if (iCod < 0 || iQtd < 0) throw new Error('não achei as colunas CÓDIGO e ESTOQUE no cabeçalho do arquivo');
+    const m = new Map();
+    linhas.slice(1).forEach(l => {
+      const codigo = codigoFKN(l[iCod]);
+      if (!codigo) return;
+      const txt = i => (i >= 0 && l[i] != null ? String(l[i]).trim() : '');
+      m.set(codigo, { codigo, descricao: txt(iDesc) || codigo, unidade: txt(iUn) || null, localizacao: txt(iLoc) || null,
+        quantidade: R.numeroBR(l[iQtd]) || 0, custo_total: iCusto >= 0 ? R.numeroBR(l[iCusto]) || 0 : 0 });
+    });
+    return [...m.values()];
+  }
+  const codigoFKN = v => String(v == null ? '' : v).trim().replace(/\.0+$/, '');
+
+  // Listagem cadastral de produtos do FKN (SIFN108, salva em CSV): um bloco por produto, com
+  // estoque mínimo/máximo, saldo, pendências, custos, fornecedor, linha e família. A variante 1
+  // (caixa fechada do mesmo código) vira "000044.1", como no CSV de estoque. O saldo do FKN já
+  // desconta o que está reservado para cliente (saldo = atual − pendente de cliente).
+  const ehListagemProdutos = t => /LISTAGEM CADASTRAL DE PRODUTOS|ESTOQUE:;\s*m[ií]n:/i.test(String(t).slice(0, 5000));
+  function lerListagemProdutos(texto) {
+    const n = v => R.numeroBR(v) || 0;
+    const data = v => { const m = /^(\d\d)\/(\d\d)\/(\d{4})$/.exec(String(v || '').trim()); return m && m[1] !== '00' ? m[3] + '-' + m[2] + '-' + m[1] : null; };
+    const out = new Map();
+    let p = null;
+    String(texto).split(/\r?\n/).forEach(l => {
+      let m = /^(\d{3,});(\d);([^;]*);([^;]*);([^;]*);([^;]*);([^;]*);?\s*$/.exec(l);
+      if (m) {
+        p = { codigo: m[1] + (m[2] === '0' ? '' : '.' + m[2]), descricao: m[3].trim() || m[1], situacao: m[5].trim() || null, linha: m[6].trim() || null, familia: m[7].trim() || null };
+        out.set(p.codigo, p);
+        return;
+      }
+      if (!p) return;
+      if ((m = /ESTOQUE:;\s*m[ií]n:\s*([-\d.,]+);\s*m[aá]x:\s*([-\d.,]+);\s*atual:\s*([-\d.,]+);\s*saldo:\s*([-\d.,]+);\s*PEND:\s*cli:\s*([-\d.,]+);\s*for:\s*([-\d.,]+)/i.exec(l)))
+        Object.assign(p, { estoque_min: n(m[1]), estoque_max: n(m[2]), estoque_atual: n(m[3]), quantidade: n(m[4]), pend_cliente: n(m[5]), pend_fornecedor: n(m[6]) });
+      else if ((m = /comp:\s*([-\d.,]+);\s*cus:\s*([-\d.,]+);\s*ven:\s*([-\d.,]+)/i.exec(l)))
+        Object.assign(p, { custo_compra: n(m[1]), custo_unit: n(m[2]), preco_venda: n(m[3]) });
+      else if ((m = /Fornecedor:\s*(\d+)\s*([^;]*)/i.exec(l)))
+        Object.assign(p, { fornecedor_cod: /^0+$/.test(m[1]) ? null : m[1], fornecedor: /^0+$/.test(m[1]) ? null : m[2].trim() || null });
+      else if ((m = /localiz:([^;]*)/i.exec(l))) p.localizacao = m[1].trim() || null;
+      else if ((m = /[úu]lt\.entrada:\s*([\d/]+)\s+[úu]lt\.sa[íi]da:\s*([\d/]+)/i.exec(l))) Object.assign(p, { ult_entrada: data(m[1]), ult_saida: data(m[2]) });
+    });
+    const lista = [...out.values()].filter(x => x.quantidade != null);
+    if (!lista.length) throw new Error('não achei produtos na listagem (é a "Listagem cadastral de produtos" do FKN salva em CSV?)');
+    // Entra o que está ativo e o inativo que ainda tem saldo ou pedido em aberto.
+    return lista.filter(x => x.situacao !== 'INATIVO' || x.quantidade || x.pend_fornecedor).map(x => Object.assign(x, {
+      custo_total: x.quantidade > 0 ? Math.round(x.quantidade * (x.custo_unit || 0) * 100) / 100 : 0 }));
+  }
+  // Hora em que a listagem foi gerada no FKN (cabeçalho ";DATA: 16/10/2026;" e "…;14:14;"), horário de Brasília → ISO.
+  // O estoque do CRM compara os dois saldos nessa hora (16/10/2026). Sem cabeçalho: null.
+  function posicaoListagem(texto) {
+    const ini = String(texto).split(/\r?\n/).slice(0, 8);
+    let d = null, h = null, m;
+    ini.forEach(l => {
+      if (!d && (m = /^;DATA:\s*(\d\d)\/(\d\d)\/(\d{4})/.exec(l))) d = m[3] + '-' + m[2] + '-' + m[1];
+      if (!h && (m = /;(\d\d:\d\d);\s*$/.exec(l))) h = m[1];
+    });
+    return d ? new Date(d + 'T' + (h || '00:00') + ':00-03:00').toISOString() : null;
+  }
+  // Qualquer um dos dois arquivos do FKN: listagem cadastral (completa) ou o CSV simples de estoque.
+  const lerArquivoEstoque = t => (ehListagemProdutos(t) ? lerListagemProdutos(t) : lerEstoque(t));
+
+
+  // ------------------------------------------------------------ contas a receber (SIFN016)
+  // "28/09/26" ou "28/09/2026" → "2026-09-28"; "00/00/0000" → null.
+  function dataFKN(v) {
+    const m = /^(\d\d)\/(\d\d)\/(\d\d|\d{4})$/.exec(String(v || '').trim());
+    if (!m || m[1] === '00') return null;
+    return (m[3].length === 2 ? '20' + m[3] : m[3]) + '-' + m[2] + '-' + m[1];
+  }
+
+  const ehContasReceber = t => /CONTAS A RECEBER/i.test(String(t).slice(0, 3000));
+  function lerContasReceber(texto) {
+    if (!ehContasReceber(texto)) throw new Error('não parece a listagem de contas a receber do FKN (Contas a receber por cliente, salva em CSV)');
+    let cli = null, posicao = null, hora = null, totalGeral = null, vencidoGeral = null;
+    const porDup = new Map();
+    String(texto).split(/\r?\n/).forEach(l => {
+      let m;
+      if (!posicao && (m = /^;DATA:\s*(\d\d\/\d\d\/\d{4})/.exec(l))) { posicao = dataFKN(m[1]); return; }
+      if (!hora && (m = /;(\d\d:\d\d);\s*$/.exec(l))) hora = m[1];
+      if ((m = /^CLIENTE:\s*(\d+)\s+([^;]*);(?:TEL:([^;]*);)?(?:VEND:\s*([^;]*);)?/.exec(l))) {
+        cli = { codigo: m[1], nome: m[2].trim(), vendedor: (m[4] || '').trim(), doc: '' };
+        return;
+      }
+      if (cli && (m = /^(?:CNPJ|CPF)\.*:\s*([\dA-Za-z./-]+)/.exec(l))) { cli.doc = doc(m[1]); return; }
+      if ((m = /^\s*(\d+)\/(\d+)([^;]*);\s*(\d\d\/\d\d\/\d\d(?:\d\d)?);\s*([-\d.,]+);\s*(\d\d\/\d\d\/\d\d(?:\d\d)?);\s*(\d*);([^;]*)/.exec(l))) {
+        if (!cli) return;
+        let dup = m[1] + '/' + m[2];
+        if (porDup.has(dup)) dup += '-' + cli.codigo; // mesmo número em clientes diferentes (raro)
+        porDup.set(dup, { duplicata: dup, nota_numero: +m[1], parcela: +m[2], abono: /!/.test(m[3]),
+          cliente_codigo: cli.codigo, cliente_nome: cli.nome || null, cliente_doc: cli.doc || null, vendedor_nome: cli.vendedor || null,
+          emitida_em: dataFKN(m[4]), vencimento: dataFKN(m[6]), valor: R.numeroBR(m[5]) || 0, portador: m[8].trim() || null });
+        return;
+      }
+      if ((m = /TOTAL GERAL[.\s]*:;\s*([-\d.,]+)/.exec(l))) totalGeral = R.numeroBR(m[1]);
+      else if (totalGeral != null && vencidoGeral == null && (m = /VENCIDO:;\s*([-\d.,]+)/.exec(l))) vencidoGeral = R.numeroBR(m[1]);
+    });
+    const titulos = [...porDup.values()].filter(t => t.vencimento);
+    if (!titulos.length) throw new Error('não achei títulos na listagem (use "Em aberto" e salve em CSV)');
+    const soma = Math.round(titulos.reduce((s, t) => s + t.valor, 0) * 100) / 100;
+    return { posicao, hora, titulos, soma, totalGeral, vencidoGeral, confere: totalGeral == null || Math.abs(soma - totalGeral) < 0.02,
+      clientes: new Set(titulos.map(t => t.cliente_codigo)).size };
+  }
+
+  // Cliente do CRM de cada título: a nota de mesmo número e mesmo CNPJ (a mais certa); senão o
+  // cadastro com o CNPJ (havendo mais de um, o que tem notas). Sem nenhum, fica sem cliente.
+  function ligaEmpresas(titulos, D, ix) {
+    const notasNum = new Map();
+    (D.notas || []).forEach(n => { if (n.numero != null && n.empresa_id) { const k = String(+n.numero); if (!notasNum.has(k)) notasNum.set(k, []); notasNum.get(k).push(n); } });
+    const porDoc = new Map();
+    (D.empresas || []).forEach(e => { const d = doc(e.cnpj); if (d.length >= 11) { if (!porDoc.has(d)) porDoc.set(d, []); porDoc.get(d).push(e); } });
+    const nNotas = e => ((ix && ix.porEmpresa && ix.porEmpresa.notas.get(e.id)) || []).length;
+    let pelaNota = 0, peloDoc = 0, sem = 0;
+    const out = titulos.map(t => {
+      const dc = doc(t.cliente_doc);
+      const n = (notasNum.get(String(t.nota_numero)) || []).find(x => !dc || doc(x.cliente_doc) === dc);
+      let empresa_id = n ? n.empresa_id : null;
+      if (empresa_id) pelaNota++;
+      else {
+        const l = porDoc.get(dc) || [];
+        const e = l.slice().sort((a, b) => nNotas(b) - nNotas(a) || (a.grupo_id ? 1 : 0) - (b.grupo_id ? 1 : 0))[0];
+        if (e) { empresa_id = e.id; peloDoc++; } else sem++;
+      }
+      return Object.assign({}, t, { empresa_id });
+    });
+    return { titulos: out, pelaNota, peloDoc, sem };
+  }
+
+
+  // ------------------------------------------------------------ conferência do relatório
+  // O relatório é puxado à mão no FKN: opção esquecida = dado faltando. "recusa" = não troca o que
+  // já está no CRM (diz o que marcar); "avisos" = entra, mas falta um detalhe. Mesmas regras na
+  // tela e na Edge Function (o vigia).
+  const conta = (t, re) => (String(t).match(re) || []).length;
+  function conferirListagemProdutos(texto) {
+    const t = String(texto), recusa = [], avisos = [];
+    const blocos = conta(t, /^\d{3,};\d;/gm);
+    if (!blocos) recusa.push('não achei produtos: é a "Listagem cadastral de produtos" salva em CSV?');
+    else {
+      const falta = (re, nome) => conta(t, re) < blocos * 0.9;
+      if (falta(/ESTOQUE:;\s*m[ií]n:/gi)) recusa.push('marque "Estoque/pendências" em Listar dados');
+      if (falta(/comp:\s*[-\d.,]+;\s*cus:/gi)) recusa.push('marque "Índices/preços" em Listar dados');
+      if (falta(/Fornecedor:\s*\d+/gi)) recusa.push('marque "Fornecedor" em Listar dados');
+      if (falta(/[úu]lt\.entrada:/gi)) avisos.push('"Movimentação (datas)" não veio marcado (última entrada e saída ficam em branco)');
+      if (falta(/localiz:/gi)) avisos.push('"Localização" não veio marcado');
+      if (!/;\s*INATIVO\s*;/i.test(t)) avisos.push('não veio nenhum produto inativo: confira se "Situação" está 0 (todos)');
+    }
+    return { recusa, avisos, produtos: blocos };
+  }
+  function conferirContasReceber(texto, lido) {
+    const t = String(texto), recusa = [], avisos = [];
+    const cab = (/^.*CONTAS A RECEBER[^\n]*/im.exec(t) || [''])[0];
+    if (!/EM ABERTO/i.test(cab)) recusa.push('em "Listar títulos" escolha "Em aberto"');
+    const per = /VENCTO\s*EM:\s*(\d\d\/\d\d\/\d{4})\s*A\s*(\d\d\/\d\d\/\d{4})/i.exec(cab);
+    if (per && !(/^00\/00/.test(per[1]) && /^00\/00/.test(per[2]))) recusa.push('deixe o período de vencimento em branco (veio ' + per[1] + ' a ' + per[2] + ')');
+    const l = (lido && lido.titulos) || [];
+    if (l.length && l.filter(x => !x.cliente_doc).length > l.length / 2) recusa.push('marque "Listar os dados cadastrais dos clientes" (é o que traz o CNPJ)');
+    if (lido && lido.totalGeral == null) recusa.push('o arquivo veio sem o TOTAL GERAL no fim: salve com "Tudo" (não só a página)');
+    else if (lido && !lido.confere) recusa.push('a soma dos títulos não bate com o TOTAL GERAL: gere de novo');
+    return { recusa, avisos };
+  }
+
+  // ------------------------------------------------------------ contas a pagar (SIFN083)
+  // "Contas à Pagar por Conta/Fornecedor", em aberto. Blocos "CONTA:;00005 NOME;TEL:…;" com as linhas
+  // "DOCUM.;EMISSAO;VALOR;VCTO;ENTRADA;PORTADOR;OBSERVACOES / SUBCONTA;" e "TOTAL GERAL...:; x".
+  // Conta com código de 5 dígitos a partir de 10000 é conta de despesa do plano de contas (salário,
+  // energia, caminhão, despesas diversas); abaixo disso, fornecedor.
+  const ehContasPagar = t => /CONTAS A PAGAR/i.test(String(t).slice(0, 3000));
+  function lerContasPagar(texto) {
+    if (!ehContasPagar(texto)) throw new Error('não parece o relatório de contas a pagar do FKN (Contas à Pagar por Conta/Fornecedor, salvo em CSV)');
+    let conta = null, posicao = null, hora = null, totalGeral = null, cab = '';
+    const contas = new Map();
+    let soma = 0;
+    String(texto).split(/\r?\n/).forEach(l => {
+      let m;
+      if (!posicao && (m = /^;DATA:\s*(\d\d\/\d\d\/\d{4})/.exec(l))) { posicao = dataFKN(m[1]); return; }
+      if (!hora && (m = /^[^;]*;(\d\d:\d\d);\s*$/.exec(l))) { hora = m[1]; return; }
+      if (!cab && /CONTAS A PAGAR/i.test(l)) { cab = l; return; }
+      if ((m = /^CONTA:;\s*(\d+)\s+([^;]*);/.exec(l))) { conta = { codigo: m[1], nome: m[2].trim() }; return; }
+      if ((m = /TOTAL GERAL[.\s]*:;\s*([-\d.,]+)/.exec(l))) { totalGeral = R.numeroBR(m[1]); return; }
+      const c = l.split(';');
+      if (!conta || c.length < 5 || !c[0].trim() || !/^\d\d\/\d\d\/\d{4}$/.test((c[1] || '').trim()) || !/^\d\d\/\d\d\/\d{4}$/.test((c[3] || '').trim())) return;
+      const documento = c[0].trim().replace(/\s+/g, ' ');
+      const valor = R.numeroBR(c[2]) || 0;
+      soma += valor;
+      const chave = conta.codigo + '|' + documento;
+      const ant = contas.get(chave);
+      if (ant) { ant.valor = Math.round((ant.valor + valor) * 100) / 100; return; } // mesmo documento duas vezes: soma
+      contas.set(chave, { chave, conta_codigo: conta.codigo, conta_nome: conta.nome, documento, emissao: dataFKN(c[1]), valor,
+        vencimento: dataFKN(c[3]), entrada: dataFKN(c[4]), portador: (c[5] || '').trim() || null, obs: (c[6] || '').replace(/\s*\/\s*$/, '').trim() || null });
+    });
+    const lista = [...contas.values()].filter(x => x.vencimento);
+    if (!lista.length) throw new Error('não achei contas no relatório (use "Em aberto" e salve em CSV)');
+    soma = Math.round(soma * 100) / 100;
+    return { posicao, hora, cab, contas: lista, soma, totalGeral, confere: totalGeral == null || Math.abs(soma - totalGeral) < 0.02,
+      fornecedores: new Set(lista.filter(x => +x.conta_codigo < 10000).map(x => x.conta_codigo)).size };
+  }
+  function conferirContasPagar(texto, lido) {
+    const recusa = [], avisos = [];
+    const cab = (lido && lido.cab) || (/^.*CONTAS A PAGAR[^\n]*/im.exec(String(texto)) || [''])[0];
+    if (!/EM ABERTO/i.test(cab)) recusa.push('em "Listar títulos" escolha "Em aberto"');
+    const per = /EM:\s*(\d\d\/\d\d\/\d{4})\s*A\s*(\d\d\/\d\d\/\d{4})/i.exec(cab);
+    if (per && !(/^00\/00/.test(per[1]) && /^00\/00/.test(per[2]))) recusa.push('deixe o período em branco (veio ' + per[1] + ' a ' + per[2] + ')');
+    if (lido && lido.totalGeral == null) recusa.push('o arquivo veio sem o TOTAL GERAL no fim: salve com "Tudo" (não só a página)');
+    else if (lido && !lido.confere) recusa.push('a soma das contas não bate com o TOTAL GERAL: gere de novo');
+    return { recusa, avisos };
+  }
+  // Conta do FKN → lançamento do Caixa (saída).
+  function categoriaDaConta(nome) {
+    const n = R.normaliza(nome);
+    if (/salario/.test(n)) return 'Salários';
+    if (/pro ?labore/.test(n)) return 'Pró-labore';
+    if (/energia/.test(n)) return 'Energia';
+    if (/agua/.test(n)) return 'Água';
+    if (/caminhao|combustivel|frete|pedagio/.test(n)) return 'Frete e combustível';
+    if (/aluguel/.test(n)) return 'Aluguel';
+    if (/imposto|simples|icms|das\b/.test(n)) return 'Impostos';
+    return 'Outras saídas';
+  }
+  function lancamentoDoFkn(c) {
+    const despesa = +c.conta_codigo >= 10000;
+    return { tipo: 'saida', origem: 'fkn', chave_fkn: c.chave, valor: c.valor, vencimento: c.vencimento,
+      descricao: despesa ? (c.obs ? c.obs + ' (' + c.conta_nome + ')' : c.conta_nome) + ' · ' + c.documento : c.conta_nome + ' · ' + c.documento,
+      fornecedor: despesa ? null : c.conta_nome, categoria: despesa ? categoriaDaConta(c.conta_nome + ' ' + (c.obs || '')) : 'Fornecedores',
+      observacoes: [c.portador, despesa ? null : c.obs].filter(Boolean).join(' · ') || null };
+  }
+  // O que fazer com o retrato novo, dados os lançamentos que já existem:
+  //   - conta que já veio antes (mesma chave): atualiza valor e vencimento se mudaram;
+  //   - conta nova que já estava lançada à mão ou pela recorrente/planilha (saída em aberto, mesmo
+  //     valor, vencimento até 5 dias de diferença): só liga (chave_fkn), não duplica;
+  //   - conta nova antiga (venceu há mais de 60 dias ou emitida há mais de 1 ano): entra PAUSADA,
+  //     para conferir — o FKN tem pendências de anos atrás que nunca foram baixadas;
+  //   - conta que estava no retrato anterior e sumiu: paga fora do caixa (no dia do relatório);
+  //   - conta EXCLUÍDA pelo administrador no Caixa (opc.excluidos: chaves de crm_fin_fkn_excluidos,
+  //     13/10/2026): fica de fora — não volta a cada listagem.
+  function planoContasPagar(lido, existentes, opc) {
+    opc = opc || {};
+    const pos = lido.posicao || opc.hoje;
+    const corte = R.somaDias(pos, -(opc.diasAntiga || 60)), corteEmissao = R.somaDias(pos, -365);
+    const porChave = new Map((existentes || []).filter(l => l.chave_fkn).map(l => [l.chave_fkn, l]));
+    const livres = (existentes || []).filter(l => !l.chave_fkn && l.tipo === 'saida' && l.situacao === 'aberto' && l.origem !== 'titulo');
+    const usados = new Set(), excluidos = new Set(opc.excluidos || []);
+    const out = { inserir: [], atualizar: [], ligar: [], baixar: [], excluidas: 0, antigas: { qtd: 0, valor: 0 }, novas: { qtd: 0, valor: 0 } };
+    lido.contas.forEach(c => {
+      if (excluidos.has(c.chave)) { out.excluidas++; return; }
+      const ja = porChave.get(c.chave);
+      if (ja) {
+        const patch = {};
+        if (Math.abs(Number(ja.valor) - c.valor) >= 0.01) patch.valor = c.valor;
+        if (ja.vencimento !== c.vencimento && ja.situacao !== 'pago') patch.vencimento = c.vencimento;
+        if (Object.keys(patch).length) out.atualizar.push({ id: ja.id, patch });
+        return;
+      }
+      const par = livres.find(x => !usados.has(x.id) && Math.abs(Number(x.valor) - c.valor) < 0.01 && Math.abs(R.diasEntre(x.vencimento, c.vencimento)) <= 5);
+      if (par) { usados.add(par.id); out.ligar.push({ id: par.id, patch: { chave_fkn: c.chave }, descricao: par.descricao }); return; }
+      const antiga = c.vencimento < corte || (c.emissao && c.emissao < corteEmissao);
+      const l = lancamentoDoFkn(c);
+      if (antiga) {
+        l.situacao = 'pausado';
+        l.observacoes = 'pendência antiga do FKN (venceu em ' + R.dataBR(c.vencimento) + '): conferir se já foi paga' + (l.observacoes ? ' · ' + l.observacoes : '');
+        out.antigas.qtd++; out.antigas.valor = Math.round((out.antigas.valor + c.valor) * 100) / 100;
+      } else { l.situacao = 'aberto'; out.novas.qtd++; out.novas.valor = Math.round((out.novas.valor + c.valor) * 100) / 100; }
+      out.inserir.push(l);
+    });
+    const vistos = new Set(lido.contas.map(c => c.chave));
+    (existentes || []).forEach(x => {
+      if (x.chave_fkn && !vistos.has(x.chave_fkn) && (x.situacao === 'aberto' || x.situacao === 'pausado'))
+        out.baixar.push({ id: x.id, patch: { situacao: 'pago', pago_em: pos, baixa: 'fora', baixado_em: opc.agora || new Date().toISOString() } });
+    });
+    return out;
+  }
+
+  const api = { lerContasPagar, ehContasPagar, conferirContasPagar, planoContasPagar, lancamentoDoFkn, lerEstoque, lerListagemProdutos, posicaoListagem, lerArquivoEstoque, ehListagemProdutos, codigoFKN, lerContasReceber, ehContasReceber, ligaEmpresas, dataFKN,
+    conferirListagemProdutos, conferirContasReceber };
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  else raiz.CRMFkn = api;
+})(typeof window !== 'undefined' ? window : globalThis);

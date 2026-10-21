@@ -1,0 +1,13 @@
+/* barra da demonstração: fixa embaixo, por cima do CRM; a faixa do "modo local" some (aqui é de propósito) */
+#faixaModo { display: none !important; }
+.demo-barra { position: fixed; z-index: 9000; left: max(12px, env(safe-area-inset-left, 0px)); bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px; max-width: calc(100vw - 24px); padding: 8px 10px;
+  background: var(--marinho, #0f2340); color: #fff; border-radius: 12px; box-shadow: 0 8px 24px rgba(0, 0, 0, .25); font-size: .85rem; }
+.demo-selo { background: var(--ouro, #c9a15a); color: #1a1407; font-weight: 800; padding: 2px 8px; border-radius: 99px; text-transform: uppercase; letter-spacing: .04em; font-size: .72rem; }
+.demo-txt { opacity: .85; }
+.demo-ver { display: flex; align-items: center; gap: 6px; }
+.demo-ver select { font: inherit; padding: 4px 6px; border-radius: 8px; border: 0; color: #111; background: #fff; }
+.demo-barra button { font: inherit; font-weight: 700; padding: 4px 10px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, .5); background: transparent; color: #fff; cursor: pointer; }
+.demo-barra button:focus-visible, .demo-ver select:focus-visible { outline: 2px solid var(--ouro, #c9a15a); outline-offset: 2px; }
+@media print { .demo-barra { display: none; } }
+body.com-demo { padding-bottom: 96px; }

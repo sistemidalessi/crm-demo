@@ -1,0 +1,902 @@
+/* CRM Sistemi Dalessi — Gestão (só administrador): o resumo do negócio numa tela.
+   Parte pura (CRMGestao.painel / CRMGestao.compras, testada em testes/gestao.test.js) e a tela.
+   Tudo sai do que já está no CRM: notas fiscais (faturamento real), negócios, atividades e metas.
+   O "braço de compras" usa o ritmo de cada cliente e o que ele costuma levar para prever a
+   demanda dos próximos dias — o CRM não conhece o estoque (isso fica no FKN). */
+(function (raiz) {
+  'use strict';
+  const R = raiz.CRMRegras || (typeof require !== 'undefined' ? require('./regras.js') : null);
+  const num = R.num;
+
+  const somaValor = l => l.reduce((s, n) => s + num(n.valor_total), 0);
+  const variacao = (a, b) => (b ? (a - b) / b * 100 : null);
+
+  // Notas de venda (sem cancelada, com CFOP de venda) de um período, com o dono (carteira) do cliente.
+  function vendas(D, ix, de, ate) {
+    return (D.notas || []).filter(n => {
+      const d = R.diaLocal(n.emitida_em);
+      return d && d >= de && d <= ate && R.notaDeVenda(n, ix.porNota.get(n.id));
+    });
+  }
+  // Quem vendeu: o vendedor escrito na nota; sem ele, a carteira do cliente.
+  const donoDe = (ix, n) => { if (n.vendedor_id) return n.vendedor_id; if (n.vendedor_nome) return null; /* ex-vendedor */ const e = n.empresa_id && ix.porId.empresas.get(n.empresa_id); return e ? e.responsavel_id || null : null; };
+
+  function resumoPeriodo(D, ix, de, ate) {
+    const l = vendas(D, ix, de, ate);
+    const clientes = new Set(l.map(n => n.empresa_id || n.cliente_doc || n.cliente_nome));
+    const valor = somaValor(l);
+    return { valor, notas: l.length, clientes: clientes.size, ticket: l.length ? valor / l.length : 0, lista: l };
+  }
+
+  // ------------------------------------------------------------ painel
+  function painel(D, ix, cfg, hoje) {
+    const mes = hoje.slice(0, 8) + '01';
+    const fimMes = R.somaDias(R.somaMeses(mes, 1), -1);
+    const mesPassado = R.somaMeses(mes, -1);
+    const diaDoMes = +hoje.slice(8, 10), diasNoMes = +fimMes.slice(8, 10);
+    // Mesmo ponto do mês passado (até o mesmo dia), para comparar sem esperar o mês fechar.
+    const ateMesmoDia = R.somaDias(mesPassado, Math.min(diaDoMes, +R.somaDias(mes, -1).slice(8, 10)) - 1);
+    const atual = resumoPeriodo(D, ix, mes, hoje);
+    const anterior = resumoPeriodo(D, ix, mesPassado, R.somaDias(mes, -1));
+    const anteriorMesmoDia = resumoPeriodo(D, ix, mesPassado, ateMesmoDia);
+    const ano = resumoPeriodo(D, ix, hoje.slice(0, 4) + '-01-01', hoje);
+    // Equipe de vendas = tudo menos o Direto (venda do administrador, sem vendedor(a)) — 08/10/2026, Anderson.
+    const admins = new Set((D.usuarios || []).filter(u => u.papel === 'admin').map(u => u.user_id));
+    const daEquipe = l => l.filter(n => !admins.has(donoDe(ix, n)));
+    const eqAtual = daEquipe(atual.lista), eqAntes = daEquipe(anteriorMesmoDia.lista), eqMesPassado = daEquipe(anterior.lista);
+
+    // Clientes novos no mês: primeira nota de venda do cliente cai neste mês.
+    const primeira = new Map();
+    vendas(D, ix, '0000-01-01', hoje).forEach(n => { const k = n.empresa_id || n.cliente_doc || n.cliente_nome, d = R.diaLocal(n.emitida_em); if (!primeira.has(k) || d < primeira.get(k)) primeira.set(k, d); });
+    const novosMes = [...primeira.values()].filter(d => d >= mes).length;
+
+    // Base de clientes: ativo = comprou nos últimos 90 dias.
+    const limite90 = R.somaDias(hoje, -90);
+    const compraram90 = new Set(vendas(D, ix, limite90, hoje).map(n => n.empresa_id).filter(Boolean));
+
+    // Equipe: faturamento pela carteira do cliente, meta, contatos e atrasadas.
+    const metas = (D.metas || []).filter(m => m.mes === mes);
+    // (08/10/2026, Anderson) comprador não vende: fora. O administrador entra só como "Direto" (venda sem
+    // vendedor(a): "VENDEDOR: DIRETO" na nota, nomes_nota do admin), e só se vendeu no ano.
+    const ehDireto = u => u.papel === 'admin';
+    const equipe = (D.usuarios || []).filter(u => u.ativo !== false && u.papel !== 'comprador').map(u => {
+      const doMes = atual.lista.filter(n => donoDe(ix, n) === u.user_id);
+      const doAno = ano.lista.filter(n => donoDe(ix, n) === u.user_id);
+      const ativs = (D.atividades || []).filter(a => a.responsavel_id === u.user_id && a.tipo !== 'sistema');
+      const contatos = ativs.filter(a => a.concluida && (R.diaLocal(a.concluida_em || a.data_hora) || '') >= mes).length;
+      const contatosHoje = ativs.filter(a => a.concluida && R.diaLocal(a.concluida_em || a.data_hora) === hoje).length;
+      const atrasadas = ativs.filter(a => !a.concluida && R.diaLocal(a.data_hora) < hoje).length;
+      const meta = metas.filter(m => m.usuario_id === u.user_id).reduce((s, m) => s + num(m.valor), 0);
+      const valorMes = somaValor(doMes);
+      const direto = ehDireto(u);
+      return { user_id: u.user_id, nome: direto ? 'Direto' : u.nome, papel: u.papel, direto, valorMes, notasMes: doMes.length, valorAno: somaValor(doAno), meta, pctMeta: meta ? valorMes / meta * 100 : null,
+        contatos, contatosHoje, atrasadas, clientesAtivos: (D.empresas || []).filter(e => e.responsavel_id === u.user_id && compraram90.has(e.id)).length };
+    }).filter(u => !u.direto || u.valorAno > 0)
+      .sort((a, b) => (a.direto ? 1 : 0) - (b.direto ? 1 : 0) || b.valorMes - a.valorMes || b.valorAno - a.valorAno);
+    // Total = o faturamento inteiro (o mesmo do quadro do mês): o que não é de ninguém da lista (ex-vendedor(a),
+    // cliente sem carteira) vira a linha "Outros", para a soma bater.
+    const somaEq = k => equipe.reduce((t, u) => t + (u[k] || 0), 0);
+    const outros = { mes: Math.round((atual.valor - somaEq('valorMes')) * 100) / 100, ano: Math.round((ano.valor - somaEq('valorAno')) * 100) / 100 };
+    const equipeTotal = { valorMes: atual.valor, valorAno: ano.valor, meta: somaEq('meta'), clientesAtivos: somaEq('clientesAtivos'),
+      contatos: somaEq('contatos'), contatosHoje: somaEq('contatosHoje'), atrasadas: somaEq('atrasadas'), outros };
+
+    // Funil do mês (negócios) e o que está aberto — só o funil de vendas: o de pós-venda
+    // acompanha pedido já vendido e inflaria "abertos" e a conversão.
+    const funis = [...new Set((D.etapas || []).map(e => e.funil || 'Vendas'))];
+    const funilVendas = funis.find(f => !/p[óo]s[\s-]*vendas?/i.test(f)) || '';
+    const funil = R.dashboard(D, ix, cfg, hoje, { periodo: R.periodo('mes', hoje), funil: funilVendas });
+
+    // Clientes fiéis sumidos: têm ritmo, passaram de 2 ciclos sem comprar. "Em risco" = o que
+    // costumavam comprar por mês.
+    const sumidos = (D.empresas || []).map(e => {
+      const r = ix.resumo.get(e.id);
+      if (!r || !r.ritmo || !r.ultimaCompra) return null;
+      const ciclo = R.cicloRecompra(e, r, cfg), dias = R.diasEntre(r.ultimaCompra, hoje);
+      if (dias <= 2 * ciclo) return null;
+      const meses = Math.max(1, R.diasEntre(r.primeiraCompra || r.ultimaCompra, r.ultimaCompra) / 30);
+      return { empresa: e, dias, ciclo, porMes: r.totalComprado / meses, ultima: r.ultimaCompra };
+    }).filter(Boolean).sort((a, b) => b.porMes - a.porMes);
+
+    const fat = R.faturamento(D, ix, hoje, { periodo: R.periodo('ano', hoje) });
+    const fat12 = R.faturamento(D, ix, hoje, { periodo: R.periodo('12meses', hoje) });
+    return {
+      mes: { de: mes, ate: fimMes, atual, anterior, anteriorMesmoDia, variacao: variacao(atual.valor, anteriorMesmoDia.valor),
+        variacaoTicket: anterior.notas ? variacao(atual.ticket, anterior.ticket) : null,
+        projecao: diaDoMes ? atual.valor / diaDoMes * diasNoMes : 0, novos: novosMes,
+        equipe: { valor: somaValor(eqAtual), notas: eqAtual.length, lista: eqAtual, anteriorMesmoDia: somaValor(eqAntes), anterior: somaValor(eqMesPassado),
+          variacao: variacao(somaValor(eqAtual), somaValor(eqAntes)) } },
+      ano, porMes: fat12.porMes, equipe, equipeTotal, funil, funilVendas,
+      base: { clientes: (D.empresas || []).filter(e => e.situacao === 'cliente').length, ativos: compraram90.size,
+        leads: (D.empresas || []).filter(e => e.situacao === 'lead').length },
+      topClientes: fat.topClientes.slice(0, 10), topProdutos: fat.topProdutosValor.slice(0, 10),
+      sumidos, emRisco: sumidos.reduce((s, x) => s + x.porMes, 0)
+    };
+  }
+
+  // ------------------------------------------------------------ estoque (leitores em fkn.js)
+  const K = raiz.CRMFkn || (typeof require !== 'undefined' ? require('./fkn.js') : null);
+  const { lerEstoque, lerListagemProdutos, lerArquivoEstoque, ehListagemProdutos, codigoFKN } = K;
+
+  // Caixa fechada (variante 1) → quantas unidades: pela razão dos custos (caixa de 2 = 2× o custo)
+  // ou, se não bater, pelo nome ("CX C/12", "CX.4X5").
+  function fatorCaixa(u, c) {
+    const cu = num(u.custo_compra) || num(u.custo_unit), cc = num(c.custo_compra) || num(c.custo_unit);
+    const r = cu > 0 ? cc / cu : 0;
+    if (r >= 1.5 && Math.abs(r - Math.round(r)) / r < 0.05) return Math.round(r);
+    const m = /C\/\s*(\d+)/i.exec(c.descricao || '') || /CX\.?\s*(\d+)\s*X/i.exec(c.descricao || '');
+    return m && +m[1] > 1 ? +m[1] : null;
+  }
+  // Uma linha por produto. A caixa fechada (variante 1, 2…) é o MESMO estoque da unidade visto em
+  // caixas: o FKN mostra saldo, pedido, reservado e mínimo da caixa = os da unidade ÷ fator, sem
+  // fração (conferido em 15/10/2026 nos 574 pares da listagem real: todos batem). Somar contava o
+  // estoque duas vezes (R$ 107 mil a mais no "Estoque a custo" e compra sugerida a menos). Então a
+  // caixa NÃO soma: só guarda o fator (para a sugestão em caixas) e some da lista.
+  function juntaVariantes(estoque) {
+    const porCod = new Map();
+    (estoque || []).forEach(x => porCod.set(codigoFKN(x.codigo), Object.assign({}, x, { codigo: codigoFKN(x.codigo), quantidade: num(x.quantidade), custo_total: num(x.custo_total),
+      pend_fornecedor: num(x.pend_fornecedor), estoque_min: num(x.estoque_min), estoque_max: num(x.estoque_max) })));
+    porCod.forEach((c, cod) => {
+      const m = /^(.+)\.(\d+)$/.exec(cod), u = m && porCod.get(m[1]);
+      if (!u) return;
+      porCod.delete(cod);
+      const f = fatorCaixa(u, c);
+      if (!f) return;
+      u.embalagens = (u.embalagens || []).concat({ codigo: cod, fator: f, saldo: c.quantidade });
+      if (!u.caixa || f > u.caixa.fator) u.caixa = u.embalagens[u.embalagens.length - 1];
+    });
+    return [...porCod.values()];
+  }
+
+  // ------------------------------------------------------------ compras
+  // Curva ABC (12 meses): A = produtos que somam os primeiros 80% do faturamento, B até 95%, C o resto.
+  // Demanda prevista: cada cliente com ritmo e compra prevista até "dias" à frente (inclusive os que
+  // já passaram da data, mas ainda não sumiram) soma a quantidade habitual de cada item.
+  // Tendência: quantidade vendida nos últimos 90 dias × os 90 anteriores.
+  // extra (comprador sênior, 18/10/2026): { fornecedores: crm_fornecedores, produtoForn: crm_produto_fornecedor,
+  // custoHist: crm_custo_historico, aCaminho: crm_a_caminho (pedidos ao fornecedor registrados no CRM, 20/10/2026) }.
+  // Sem cadastro, o prazo do fornecedor é PRAZO_PADRAO (estimado).
+  function compras(D, ix, cfg, hoje, dias, estoque, extra) {
+    dias = dias || 30;
+    extra = extra || {};
+    const fMap = new Map((extra.fornecedores || []).map(f => [String(f.codigo), f]));
+    // o que falta chegar dos pedidos registrados no CRM, por produto
+    const pedidoCrm = new Map();
+    (extra.aCaminho || []).forEach(x => { const k = codigoFKN(x.codigo); pedidoCrm.set(k, (pedidoCrm.get(k) || 0) + num(x.falta)); });
+    const trocas = new Map((extra.produtoForn || []).filter(x => x.fornecedor).map(x => [codigoFKN(x.codigo), String(x.fornecedor)]));
+    const nomeForn = new Map();
+    (estoque || []).forEach(x => { if (x.fornecedor_cod && x.fornecedor && !nomeForn.has(x.fornecedor_cod)) nomeForn.set(x.fornecedor_cod, x.fornecedor); });
+    fMap.forEach((f, cod) => nomeForn.set(cod, f.nome));
+    const diaSemana = new Date(hoje + 'T12:00:00Z').getUTCDay();
+    const chaveItem = it => it.produto_id || (it.codigo ? 'c:' + R.normaliza(it.codigo) : 'd:' + R.normaliza(it.descricao));
+    const prods = new Map();
+    const pega = it => {
+      const k = chaveItem(it);
+      if (!prods.has(k)) prods.set(k, { chave: k, descricao: it.descricao, codigo: it.codigo || '', unidade: it.unidade || '', valor12: 0, qtd90: 0, qtd90ant: 0, clientes12: new Set(), prevista: 0, clientesPrevistos: 0 });
+      return prods.get(k);
+    };
+    const d90 = R.somaDias(hoje, -90), d180 = R.somaDias(hoje, -180), d365 = R.somaDias(hoje, -365);
+    vendas(D, ix, d365, hoje).forEach(n => {
+      const d = R.diaLocal(n.emitida_em);
+      (ix.porNota.get(n.id) || []).filter(it => R.cfopDeVenda(it.cfop)).forEach(it => {
+        const g = pega(it);
+        g.valor12 += num(it.valor_total);
+        if (n.empresa_id) g.clientes12.add(n.empresa_id);
+        if (d >= d90) g.qtd90 += num(it.quantidade);
+        else if (d >= d180) g.qtd90ant += num(it.quantidade);
+      });
+    });
+
+    const ate = R.somaDias(hoje, dias);
+    const clientesPrevistos = [];
+    (D.empresas || []).forEach(e => {
+      const r = ix.resumo.get(e.id);
+      if (!r || !r.ritmo || !r.ultimaCompra) return;
+      const ciclo = R.cicloRecompra(e, r, cfg);
+      const proxima = R.somaDias(r.ultimaCompra, ciclo);
+      if (proxima > ate || R.diasEntre(r.ultimaCompra, hoje) > 2 * ciclo) return;
+      const itens = R.itensHabituais(ix, e.id, 10);
+      if (!itens.length) return;
+      clientesPrevistos.push({ empresa: e, proxima, itens: itens.length });
+      itens.forEach(it => {
+        const k = it.produto_id || ('d:' + R.normaliza(it.descricao));
+        const g = prods.get(k) || [...prods.values()].find(x => R.normaliza(x.descricao) === R.normaliza(it.descricao)) || pega({ descricao: it.descricao, unidade: it.unidade, produto_id: it.produto_id });
+        g.prevista += num(it.quantidade); g.clientesPrevistos++;
+      });
+    });
+
+    const lista = [...prods.values()].map(g => Object.assign(g, { clientes12: g.clientes12.size, mediaMensal: g.qtd90 / 3,
+      tendencia: g.qtd90ant ? (g.qtd90 - g.qtd90ant) / g.qtd90ant * 100 : null }));
+    const total12 = lista.reduce((s, g) => s + g.valor12, 0);
+    let acum = 0;
+    lista.slice().sort((a, b) => b.valor12 - a.valor12).forEach(g => {
+      acum += g.valor12;
+      const pct = total12 ? acum / total12 * 100 : 100;
+      g.pctAcumulado = pct; g.classe = g.valor12 <= 0 ? 'C' : pct - (total12 ? g.valor12 / total12 * 100 : 0) < 80 ? 'A' : pct - (total12 ? g.valor12 / total12 * 100 : 0) < 95 ? 'B' : 'C';
+    });
+    const abc = { A: lista.filter(g => g.classe === 'A'), B: lista.filter(g => g.classe === 'B'), C: lista.filter(g => g.classe === 'C'), total: total12 };
+    const demanda = lista.filter(g => g.prevista > 0).sort((a, b) => (a.classe < b.classe ? -1 : a.classe > b.classe ? 1 : 0) || b.clientesPrevistos - a.clientesPrevistos || b.prevista - a.prevista);
+    const comMovimento = lista.filter(g => g.qtd90ant > 0 && g.qtd90 + g.qtd90ant >= 10 && g.tendencia != null);
+
+    // Com o estoque do FKN: necessidade no período = o maior entre a previsão dos clientes e o
+    // consumo médio dos últimos 90 dias. Comprar = necessidade (com piso no estoque mínimo do FKN)
+    // − saldo − o que já foi pedido ao fornecedor. Saldo negativo (vendido sem estoque, esperando a compra chegar) entra
+    // negativo: o que já foi vendido sai do que está pedido (20/10/2026, Anderson: "teria que ficar negativo, até para o
+    // comprador saber o que comprar"; antes contava zero e o pedido saía a menos). A caixa fechada
+    // é o mesmo estoque da unidade (juntaVariantes não soma).
+    const itensEst = juntaVariantes(estoque);
+    const est = new Map(itensEst.map(x => [x.codigo, x]));
+    const estPorNome = new Map(itensEst.map(x => [R.normaliza(x.descricao), x]));
+    const custoDe = x => (num(x.custo_unit) > 0 ? num(x.custo_unit) : x.quantidade > 0 && x.custo_total > 0 ? x.custo_total / x.quantidade : null);
+    const usados = new Set();
+    const aplica = (g, e) => {
+      g.saldo = e.quantidade;
+      g.custoUnit = custoDe(e);
+      // já pedido: a pendência do FKN ou o pedido registrado no CRM, o maior (no paralelo o mesmo pedido costuma estar nos
+      // dois: o comprador exporta para o FKN o que registrou aqui)
+      g.pedidoCrm = pedidoCrm.get(codigoFKN(e.codigo)) || 0;
+      g.pedido = Math.max(e.pend_fornecedor || 0, g.pedidoCrm);
+      g.minimo = e.estoque_min || 0;
+      g.maximo = e.estoque_max || 0;
+      g.fornecedor = e.fornecedor || null; g.fornecedorCod = e.fornecedor_cod || null;
+      const troca = trocas.get(e.codigo);
+      if (troca) { g.fornecedorCod = troca; g.fornecedor = nomeForn.get(troca) || troca; g.fornecedorTrocado = true; }
+      // fornecedor do FKN de quem não se compra mais (cadastro "ainda compramos? não"): o produto fica sem fornecedor
+      // até o comprador dizer de quem compra (assim a sugestão não vira pedido para quem não vende para nós)
+      else if (g.fornecedorCod && fMap.has(g.fornecedorCod) && fMap.get(g.fornecedorCod).ativo === false) {
+        g.fornecedorNoFkn = g.fornecedor || nomeForn.get(g.fornecedorCod) || g.fornecedorCod; g.fornecedorCod = null; g.fornecedor = null;
+      }
+      const fp = (g.fornecedorCod && fMap.get(g.fornecedorCod)) || null;
+      g.prazo = fp && fp.prazo_dias != null ? +fp.prazo_dias : PRAZO_PADRAO; g.prazoEstimado = !fp;
+      g.linha = e.linha || null; g.familia = e.familia || null;
+      g.inativo = e.situacao === 'INATIVO';
+      g.caixa = e.caixa || null; g.embalagens = e.embalagens || null;
+      g.precoVenda = num(e.preco_venda) || null;
+      g.ultEntrada = e.ult_entrada || null;
+      g.cobertura = g.consumoDia > 0 ? Math.max(0, g.saldo) / g.consumoDia : null;
+      // o pedido chega em "prazo" dias: o que sai até lá também precisa estar no estoque (comprador sênior)
+      g.ateChegar = g.consumoDia * g.prazo;
+      const alvo = Math.max(g.necessidade + g.ateChegar, g.minimo);
+      g.comprar = g.inativo ? 0 : Math.max(0, Math.ceil(alvo - g.saldo - g.pedido - 1e-9));
+      g.pelaMinimo = g.comprar > 0 && g.minimo > g.necessidade;
+      g.caixas = g.caixa && g.comprar ? Math.ceil(g.comprar / g.caixa.fator) : null;
+      // pedir hoje: com o que tem e o que já está pedido, acaba antes de um pedido novo chegar (ou já está abaixo do mínimo)
+      g.urgente = !g.inativo && g.comprar > 0 && ((g.consumoDia > 0 && g.saldo + g.pedido <= g.ateChegar) || (g.minimo > 0 && g.saldo < g.minimo) || g.saldo < 0);
+    };
+    lista.forEach(g => {
+      const e = (g.codigo && est.get(codigoFKN(g.codigo))) || estPorNome.get(R.normaliza(g.descricao));
+      g.consumoDia = g.qtd90 / 90;
+      g.necessidade = Math.max(g.prevista, g.consumoDia * dias);
+      if (!e) { g.saldo = null; return; }
+      usados.add(e.codigo);
+      g.codigo = g.codigo || e.codigo;
+      aplica(g, e);
+    });
+    const temEstoque = est.size > 0;
+    const ordemClasse = { A: 0, B: 1, C: 2, '—': 3 };
+    // Parado: tem saldo e custo, mas não vendeu nada em 90 dias.
+    const vendeu90 = new Set(lista.filter(g => g.qtd90 > 0 && g.codigo).map(g => codigoFKN(g.codigo)));
+    const parado = itensEst.filter(x => x.quantidade > 0 && x.custo_total > 0 && !vendeu90.has(x.codigo))
+      .sort((a, b) => b.custo_total - a.custo_total);
+    const positivos = itensEst.filter(x => x.quantidade > 0);
+    // Todos os produtos para a tela Compras: os vendidos (com a conta acima) + os que só estão no estoque.
+    const produtos = lista.slice();
+    itensEst.forEach(x => {
+      if (usados.has(x.codigo)) return;
+      const g = { chave: 'e:' + x.codigo, descricao: x.descricao, codigo: x.codigo, unidade: x.unidade || '', valor12: 0, qtd90: 0, qtd90ant: 0,
+        clientes12: 0, prevista: 0, clientesPrevistos: 0, classe: '—', consumoDia: 0, necessidade: 0, tendencia: null, soEstoque: true };
+      aplica(g, x);
+      produtos.push(g);
+    });
+    const paradoSet = new Set(parado.map(x => x.codigo));
+    produtos.forEach(g => { g.parado = !!(g.codigo && paradoSet.has(codigoFKN(g.codigo))); g.emFalta = g.saldo != null && g.saldo <= 0 && g.qtd90 > 0; });
+    const sugestao = temEstoque ? produtos.filter(g => g.saldo != null && g.comprar > 0)
+      .sort((a, b) => ordemClasse[a.classe] - ordemClasse[b.classe] || b.valor12 - a.valor12) : [];
+    const ruptura = temEstoque ? lista.filter(g => g.saldo != null && g.saldo <= 0 && g.qtd90 > 0).sort((a, b) => b.valor12 - a.valor12) : [];
+    // Pedido por fornecedor: a sugestão agrupada (o que não tem fornecedor no FKN fica junto no fim).
+    const porForn = new Map();
+    sugestao.forEach(g => {
+      const k = g.fornecedorCod || '';
+      if (!porForn.has(k)) porForn.set(k, { cod: k, nome: g.fornecedor || 'Sem fornecedor no FKN', itens: [], custo: 0, semCusto: 0, urgentes: 0 });
+      const f = porForn.get(k);
+      f.itens.push(g); if (g.custoUnit) f.custo += g.custoUnit * g.comprar; else f.semCusto++;
+      if (g.urgente) f.urgentes++;
+    });
+    porForn.forEach(f => {
+      const fp = (f.cod && fMap.get(f.cod)) || null;
+      f.cadastro = fp; f.prazo = fp ? +fp.prazo_dias : PRAZO_PADRAO; f.prazoEstimado = !fp;
+      f.pedidoMinimo = fp && num(fp.pedido_minimo) > 0 ? num(fp.pedido_minimo) : null;
+      f.faltaMinimo = f.pedidoMinimo ? Math.max(0, f.pedidoMinimo - f.custo) : 0;
+      f.diaDePedido = !!(fp && (fp.dias_pedido || []).map(Number).includes(diaSemana));
+      f.freteCif = fp ? fp.frete === 'cif' || (fp.frete === 'cif_acima' && num(fp.frete_cif_acima) > 0 && f.custo >= num(fp.frete_cif_acima)) : null;
+    });
+    const fornecedores = [...porForn.values()].sort((a, b) => (!a.cod) - (!b.cod) || b.urgentes - a.urgentes || b.custo - a.custo);
+    // Pedir hoje: fornecedor com produto que acaba antes da entrega, ou que tem hoje como dia de pedido.
+    const pedirHoje = fornecedores.filter(f => f.cod && (f.urgentes > 0 || f.diaDePedido)).sort((a, b) => b.urgentes - a.urgentes || b.custo - a.custo);
+    // Produtos que vendem e não têm fornecedor (no FKN nem trocado aqui): sem eles, a sugestão não vira pedido.
+    const semFornecedor = produtos.filter(g => g.saldo != null && !g.inativo && !g.fornecedorCod && g.qtd90 > 0).sort((a, b) => b.valor12 - a.valor12);
+    // Preço de compra que subiu (últimos 60 dias, 3% ou mais): a última mudança de cada produto.
+    const desde = R.somaDias(hoje, -60), ultimaMud = new Map();
+    (extra.custoHist || []).forEach(h => { const d = R.diaLocal(h.em); if (d < desde) return; const c = codigoFKN(h.codigo); const a = ultimaMud.get(c); if (!a || h.em > a.em) ultimaMud.set(c, h); });
+    const porCod = new Map(produtos.filter(g => g.codigo).map(g => [codigoFKN(g.codigo), g]));
+    const custoSubiu = [...ultimaMud.values()].filter(h => num(h.custo_de) > 0 && num(h.custo_para) >= num(h.custo_de) * 1.03).map(h => {
+      const g = porCod.get(codigoFKN(h.codigo));
+      return { codigo: h.codigo, descricao: (g && g.descricao) || h.descricao, de: num(h.custo_de), para: num(h.custo_para), pct: (num(h.custo_para) / num(h.custo_de) - 1) * 100,
+        em: h.em, fornecedor: (g && g.fornecedor) || nomeForn.get(h.fornecedor_cod) || null, classe: g ? g.classe : '—', precoVenda: g ? g.precoVenda : null };
+    }).sort((a, b) => (a.classe < b.classe ? -1 : a.classe > b.classe ? 1 : 0) || b.pct - a.pct);
+    // Todos os fornecedores (para o cadastro): os da listagem do FKN + os cadastrados aqui.
+    const contaForn = new Map();
+    itensEst.forEach(x => { const cod = trocas.get(x.codigo) || x.fornecedor_cod; if (cod && x.situacao !== 'INATIVO') contaForn.set(cod, (contaForn.get(cod) || 0) + 1); });
+    const todosForn = [...new Set([...nomeForn.keys()])].map(cod => ({ cod, nome: nomeForn.get(cod) || cod, produtos: contaForn.get(cod) || 0, cadastro: fMap.get(cod) || null,
+      naoCompramos: !!(fMap.get(cod) && fMap.get(cod).ativo === false) }))
+      .sort((a, b) => b.produtos - a.produtos || a.nome.localeCompare(b.nome, 'pt-BR'));
+    const distintos = campo => [...new Set(produtos.map(g => g[campo]).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'pt-BR'));
+    const estoqueInfo = temEstoque ? {
+      produtos: est.size, valor: positivos.reduce((s, x) => s + x.custo_total, 0),
+      em: (estoque || []).reduce((m, x) => (x.atualizado_em && x.atualizado_em > m ? x.atualizado_em : m), ''),
+      negativos: itensEst.filter(x => x.quantidade < 0).length,
+      valorSugestao: sugestao.reduce((s, g) => s + (g.custoUnit ? g.custoUnit * g.comprar : 0), 0),
+      semCusto: sugestao.filter(g => !g.custoUnit).length,
+      valorParado: parado.reduce((s, x) => s + x.custo_total, 0),
+      completo: itensEst.some(x => x.fornecedor_cod !== undefined || x.estoque_min > 0), // veio da listagem cadastral
+      pedidos: itensEst.filter(x => x.pend_fornecedor > 0).length
+    } : null;
+    return { dias, demanda, produtos, estoque: estoqueInfo, sugestao, ruptura, parado, pedidoPorFornecedor: fornecedores, pedirHoje, semFornecedor, custoSubiu, todosFornecedores: todosForn,
+      listas: { fornecedores: distintos('fornecedor'), linhas: distintos('linha'), familias: distintos('familia') }, clientesPrevistos: clientesPrevistos.sort((a, b) => (a.proxima < b.proxima ? -1 : 1)), abc,
+      emAlta: comMovimento.filter(g => g.tendencia >= 25).sort((a, b) => b.tendencia - a.tendencia).slice(0, 8),
+      emQueda: comMovimento.filter(g => g.tendencia <= -25).sort((a, b) => a.tendencia - b.tendencia).slice(0, 8) };
+  }
+
+  const PRAZO_PADRAO = 7; // dias de entrega quando o fornecedor ainda não tem cadastro (pedido do Anderson)
+  const G = { PRAZO_PADRAO, painel, compras, lerEstoque, lerListagemProdutos, lerArquivoEstoque, ehListagemProdutos, juntaVariantes, fatorCaixa, codigoFKN };
+  raiz.CRMGestao = G;
+  if (typeof module !== 'undefined') module.exports = G;
+
+  // ------------------------------------------------------------ tela
+  const CRM = raiz.CRM;
+  if (!CRM || !CRM.telas) return;
+  const { esc } = CRM;
+  const E = () => CRM.estado;
+  let ultimo = null; // o que a tela mostrou (para exportar)
+  let diasCompras = 30;
+  let estoque = null;      // retrato do FKN (carregado sob demanda: só o administrador lê)
+  let lendoEstoque = false;
+  // Tabela de Compras enxuta por padrão (18/10/2026, "telas com muita coisa mais suaves"): a escolha fica no navegador.
+  let todasColunas = false;
+  try { todasColunas = localStorage.getItem('crm_compras_colunas') === 'todas'; } catch (e) { /* sem armazenamento */ }
+  let extra = {};          // { fornecedores, produtoForn, custoHist } (carregaEstoque)
+  async function carregaEstoque() {
+    if (lendoEstoque) return;
+    lendoEstoque = true;
+    const st = CRM.store();
+    try { estoque = st.estoque ? await st.estoque() : []; } catch (e) { estoque = []; CRM.falhou(e); }
+    // comprador sênior: cadastro dos fornecedores, trocas de fornecedor e o histórico do custo (sem as tabelas, segue sem)
+    const [fornecedores, produtoForn, custoHist, aCaminho] = await Promise.all([st.fornecedores ? st.fornecedores().catch(() => []) : [],
+      st.produtoForn ? st.produtoForn().catch(() => []) : [], st.custoHist ? st.custoHist(90).catch(() => []) : [], st.aCaminho ? st.aCaminho().catch(() => []) : []]);
+    extra = { fornecedores, produtoForn, custoHist, aCaminho };
+    // pendências do comprador (notas de compra para dar entrada, Sefaz sem ciência): sem as tabelas, o painel segue sem
+    try {
+      const compras = st.comprasPendentes ? await st.comprasPendentes() : [];
+      const ids = compras.map(c => c.id);
+      const [itensProd, itensPend, semCiencia] = await Promise.all([ids.length && st.comprasItensProduto ? st.comprasItensProduto().catch(() => []) : [],
+        ids.length && st.compraItensDe ? st.compraItensDe(ids).catch(() => []) : [], st.dfeSemCiencia ? st.dfeSemCiencia().catch(() => 0) : 0]);
+      extra.pend = { compras, itensProd, itensPend, semCiencia };
+    } catch (e) { extra.pend = null; }
+    lendoEstoque = false;
+    CRM.render();
+  }
+
+  const pct = v => (v == null ? '—' : (v > 0 ? '+' : '') + R.pct(v));
+  const qtd = v => String(+Number(v || 0).toFixed(1)).replace('.', ',');
+  const abrevia = v => (v >= 1e6 ? (v / 1e6).toFixed(1).replace('.', ',') + ' mi' : v >= 1e3 ? Math.round(v / 1e3) + ' mil' : String(Math.round(v)));
+  // Com "acao": o quadro vira botão (abre a lista do que conta ou aplica o filtro).
+  const kpi = (t, v, s, cls, acao, id) => (acao ? '<button type="button" class="kpi clicavel ' + (cls || '') + '" data-acao="' + acao + '" data-id="' + id + '" title="Ver quais são">' : '<div class="kpi ' + (cls || '') + '">') +
+    '<span>' + esc(t) + '</span><strong>' + esc(v) + '</strong><small>' + s + '</small>' + (acao ? '</button>' : '</div>');
+  const seta = v => (v == null ? '' : v >= 0 ? '<span class="g-sobe">▲ ' + esc(pct(v)) + '</span>' : '<span class="g-desce">▼ ' + esc(pct(v)) + '</span>');
+
+  CRM.telas.gestao = {
+    render() {
+      if (!CRM.ehAdmin()) return '<div class="cartao"><p class="vazio">Esta tela é só do administrador.</p></div>';
+      const hoje = CRM.hoje(), cfg = E().cfg;
+      const p = G.painel(E().D, E().ix, cfg, hoje);
+      if (estoque === null) setTimeout(carregaEstoque, 0);
+      const c = G.compras(E().D, E().ix, cfg, hoje, diasCompras, estoque || [], extra);
+      ultimo = { p, c };
+      const m = p.mes, f = p.funil;
+      const maxMes = Math.max(1, ...p.porMes.map(x => x.valor));
+      const nomeMes = new Date(hoje + 'T12:00:00').toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' });
+      const semNotas = !(E().D.notas || []).length;
+
+      return '<div class="cabecalho"><div><h1>Gestão</h1><p class="sub">Resumo de ' + esc(nomeMes) + ' até hoje · faturamento pelas notas fiscais · só você vê esta tela</p></div></div>' +
+        (semNotas ? '<div class="cartao"><p class="vazio">Sem notas fiscais importadas: o faturamento, os tops e as compras aparecem quando as notas entrarem.</p></div>' : '') +
+        // ---- números do mês
+        '<section class="kpis">' +
+          kpi('Faturamento do mês · Equipe de vendas', R.moeda(m.equipe.valor), seta(m.equipe.variacao) + ' vs. mesmo ponto de ' + esc(R.mesCurto(R.somaMeses(m.de, -1))) + ' (' + esc(R.moeda(m.equipe.anteriorMesmoDia)) + ') · ' + m.equipe.notas + ' notas, sem o Direto', 'azul', 'gestao-lista', 'mes-equipe') +
+          kpi('Projeção do mês', R.moeda(m.projecao), 'no ritmo atual · mês passado fechou em ' + esc(R.moeda(m.anterior.valor))) +
+          kpi('Conversão do mês', f.conversao == null ? '—' : R.pct(f.conversao), f.realizadas.qtd + ' ganhos · ' + f.perdidas.qtd + ' perdidos' + (p.funilVendas ? ' · ' + esc(p.funilVendas) : ''), '', 'gestao-lista', 'decididos') +
+          // Ticket médio ao lado da conversão (pedido do Anderson, 06/10): por nota fiscal do mês (o que
+          // de fato faturou), comparado com o mês passado; o dos negócios ganhos vem embaixo.
+          kpi('Ticket médio do mês', m.atual.notas ? R.moeda(m.atual.ticket) : '—', (m.atual.notas ? seta(m.variacaoTicket) + ' vs. ' + esc(R.mesCurto(R.somaMeses(m.de, -1))) + ' (' + esc(R.moeda(m.anterior.ticket)) + ') · ' + m.atual.notas + ' notas' : 'sem notas no mês') +
+            (f.realizadas.qtd ? ' · negócios ganhos: ' + esc(R.moeda(f.ticket)) : ''), 'verde', 'gestao-lista', 'mes') +
+          kpi('Clientes que compraram', String(m.atual.clientes), m.novos + ' novo(s) no mês', 'verde', 'gestao-lista', 'clientes') +
+          kpi('Negócios abertos', R.moeda(f.abertas.valor), f.abertas.qtd + ' negócios · ponderado pela chance ' + esc(R.moeda(f.abertas.ponderado)) + (p.funilVendas ? ' · ' + esc(p.funilVendas) : ''), '', 'gestao-lista', 'abertos') +
+          kpi('Faturamento no ano', R.moeda(p.ano.valor), p.ano.notas + ' notas · ' + p.ano.clientes + ' clientes', '', 'gestao-lista', 'ano') +
+        '</section>' +
+        // faturamento geral do mês (equipe + Direto), logo abaixo do da equipe
+        '<section class="kpis kpis-linha2">' +
+          kpi('Faturamento do mês · Geral (com o Direto)', R.moeda(m.atual.valor), seta(m.variacao) + ' vs. mesmo ponto de ' + esc(R.mesCurto(R.somaMeses(m.de, -1))) + ' (' + esc(R.moeda(m.anteriorMesmoDia.valor)) + ')', 'azul', 'gestao-lista', 'mes') +
+        '</section>' +
+        // ---- 12 meses + base
+        '<div class="g-duas">' +
+          '<section class="cartao"><h2>Faturamento por mês <small>12 meses</small></h2><div class="grafico-colunas">' + p.porMes.map(x => '<div class="col" title="' + esc(R.mesCurto(x.mes) + ': ' + R.moeda(x.valor) + ' (' + x.qtd + ' notas)') + '">' +
+            '<span class="col-valor">' + (x.valor ? esc(abrevia(x.valor)) : '') + '</span><span class="col-barra"><span data-altura="' + (x.valor / maxMes * 100).toFixed(1) + '"></span></span><span class="col-rot">' + esc(R.mesCurto(x.mes)) + '</span></div>').join('') + '</div></section>' +
+          '<section class="cartao"><h2>Base de clientes</h2><dl class="g-base">' +
+            '<div><dt>Clientes</dt><dd>' + p.base.clientes + '</dd></div><div><dt>Compraram nos últimos 90 dias</dt><dd>' + p.base.ativos + '</dd></div>' +
+            '<div><dt>Leads na base</dt><dd>' + p.base.leads + '</dd></div><div><dt>Fiéis que sumiram</dt><dd>' + p.sumidos.length + ' <small>' + esc(R.moeda(p.emRisco)) + '/mês em risco</small></dd></div>' +
+          '</dl></section>' +
+        '</div>' +
+        // ---- equipe
+        '<section class="cartao"><h2>Equipe <small>faturamento pela carteira do cliente</small></h2><div class="tabela-rolagem"><table class="tabela"><thead><tr><th>Vendedor(a)</th><th class="num">Mês</th><th class="num">Meta</th><th class="num">Ano</th><th class="num">Clientes ativos</th><th class="num">Contatos no mês</th><th class="num">Hoje</th><th class="num">Atrasadas</th></tr></thead><tbody>' +
+          p.equipe.map(u => '<tr><td><strong>' + esc(u.nome) + '</strong>' + (u.direto ? ' <small>Venda sem vendedor(a)</small>' : '') + '</td><td class="num">' + esc(R.moeda(u.valorMes)) + '</td><td class="num">' + (u.meta ? CRM.barra(u.valorMes, u.meta, R.pct(u.pctMeta)) : '—') + '</td>' +
+            '<td class="num">' + esc(R.moeda(u.valorAno)) + '</td>' +
+            (u.direto ? '<td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td>'
+              : '<td class="num">' + u.clientesAtivos + '</td><td class="num">' + u.contatos + '</td><td class="num">' + u.contatosHoje + '</td>' +
+                '<td class="num">' + (u.atrasadas ? CRM.selo(String(u.atrasadas), u.atrasadas > 10 ? 'vermelho' : 'ambar') : '0') + '</td>') + '</tr>').join('') +
+          (Math.abs(p.equipeTotal.outros.mes) >= 0.01 || Math.abs(p.equipeTotal.outros.ano) >= 0.01
+            ? '<tr><td><strong>Ex-vendedores(as)</strong> <small>e clientes sem carteira</small></td><td class="num">' + esc(R.moeda(p.equipeTotal.outros.mes)) + '</td><td class="num">—</td><td class="num">' + esc(R.moeda(p.equipeTotal.outros.ano)) + '</td>' +
+              '<td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td></tr>' : '') +
+          '</tbody><tfoot><tr class="total"><td><strong>Total</strong></td><td class="num">' + esc(R.moeda(p.equipeTotal.valorMes)) + '</td><td class="num">' + (p.equipeTotal.meta ? esc(R.moeda(p.equipeTotal.meta)) : '—') + '</td>' +
+            '<td class="num">' + esc(R.moeda(p.equipeTotal.valorAno)) + '</td><td class="num">' + p.equipeTotal.clientesAtivos + '</td><td class="num">' + p.equipeTotal.contatos + '</td><td class="num">' + p.equipeTotal.contatosHoje + '</td>' +
+            '<td class="num">' + p.equipeTotal.atrasadas + '</td></tr></tfoot></table></div></section>' +
+        // ---- tops
+        '<div class="g-duas">' +
+          '<section class="cartao"><h2>Top 10 clientes <small>no ano</small></h2>' + listaTop(p.topClientes.map(x => ({ nome: x.nome, valor: x.valor, info: x.notas + ' notas · última ' + R.dataBR(x.ultima), id: x.empresa_id })), p.ano.valor) + '</section>' +
+          '<section class="cartao"><h2>Top 10 produtos <small>no ano</small></h2>' + listaTop(p.topProdutos.map(x => ({ nome: R.nomeDeItem(x.descricao), valor: x.valor, info: qtd(x.quantidade) + ' ' + (x.unidade || '') + ' · ' + x.clientes + ' clientes' })), p.ano.valor) + '</section>' +
+        '</div>' +
+        // ---- clientes em risco
+        '<section class="cartao"><h2>Clientes fiéis que sumiram <small>passaram de 2 ciclos sem comprar · ordenados pelo que compravam por mês</small></h2>' +
+          (p.sumidos.length ? '<ul class="lista">' + p.sumidos.slice(0, 10).map(s => '<li><button type="button" class="linha" data-acao="abrir-empresa" data-id="' + esc(s.empresa.id) + '"><strong>' + esc(s.empresa.nome) + '</strong><small>' +
+            esc(R.moeda(s.porMes)) + '/mês · comprava a cada ~' + s.ciclo + ' dias · sem comprar há ' + s.dias + ' dias · ' + esc(CRM.nomeUsuario(s.empresa.responsavel_id)) + '</small></button>' + CRM.acoesRapidas(s.empresa.id) + '</li>').join('') + '</ul>' +
+            (p.sumidos.length > 10 ? '<p class="mais">e mais ' + (p.sumidos.length - 10) + '…</p>' : '') : '<p class="vazio">Nenhum cliente fiel parado. 👍</p>') + '</section>' +
+        // ---- compras (o detalhe fica na aba Compras)
+        '<section class="cartao"><h2>Compras <small>resumo · o detalhe, com filtros e pesquisa, fica na aba Compras</small><span class="flex"></span><button type="button" class="btn sec" data-acao="aba" data-id="compras">Abrir Compras</button></h2>' +
+          (c.estoque ? '<dl class="g-base g-base-4"><div><dt>Estoque a custo</dt><dd>' + esc(R.moeda(c.estoque.valor)) + '</dd></div><div><dt>Sugestão de pedido (' + c.dias + ' dias)</dt><dd>' + esc(R.moeda(c.estoque.valorSugestao)) + ' <small>' + c.sugestao.length + ' produtos</small></dd></div>' +
+            '<div><dt>Em falta</dt><dd>' + c.ruptura.length + ' <small>vendeu em 90 dias e está zerado</small></dd></div><div><dt>Estoque parado</dt><dd>' + esc(R.moeda(c.estoque.valorParado)) + ' <small>sem venda em 90 dias</small></dd></div></dl>' +
+            '<p class="dica">Estoque do FKN de ' + esc(R.dataBR(c.estoque.em) + ' ' + R.horaLocal(c.estoque.em)) + '.</p>'
+            : '<p class="vazio">Sem estoque do FKN ainda: em Compras, use "Atualizar estoque (listagem do FKN)".</p>') + '</section>' +
+        (CRM.cartaoReceber ? CRM.cartaoReceber() : '');
+    },
+    depois() { if (CRM.depoisReceber) CRM.depoisReceber(); }
+  };
+
+  // ================================================================ Compras (admin e comprador)
+  // Uma tabela de produtos com pesquisa e filtros: o que comprar, em falta, parado, vendidos ou
+  // todo o estoque. Exporta exatamente o que está na tela.
+  const fc = { busca: '', curva: '', mostrar: 'comprar', ordem: 'curva', fornecedor: '', linha: '' };
+  const MOSTRAR = [['comprar', 'Sugestão de pedido (precisa comprar)'], ['falta', 'Em falta (vendeu e está zerado)'], ['parado', 'Estoque parado (sem venda em 90 dias)'],
+    ['minimo', 'Abaixo do mínimo do FKN'], ['pedidos', 'Já pedidos ao fornecedor (chegando)'], ['vendidos', 'Vendidos nos últimos 12 meses'], ['todos', 'Todos os produtos']];
+  const ORDEM = [['curva', 'Curva (A primeiro) e faturamento'], ['pedido', 'Maior custo do pedido'], ['dura', 'Acaba antes'], ['vendido', 'Mais vendido (R$ 12 meses)'],
+    ['parado', 'Maior valor parado'], ['nome', 'Nome']];
+  const OC = { A: 0, B: 1, C: 2, '—': 3 };
+  // [chave, título, número?, valor para ordenar]
+  const COLUNAS = [
+    ['produto', 'Produto', false, g => R.normaliza(R.nomeDeItem(g.descricao))],
+    ['fornecedor', 'Fornecedor', false, g => (g.fornecedor ? R.normaliza(g.fornecedor) : null)],
+    ['curva', 'Curva', false, g => (g.classe === '—' ? null : OC[g.classe])],
+    ['estoque', 'Estoque', true, g => g.saldo],
+    ['minimo', 'Mín. FKN', true, g => g.minimo || null],
+    ['pedido', 'Já pedido', true, g => g.pedido || null],
+    ['consumo', 'Consumo/mês', true, g => (g.consumoDia ? g.consumoDia * 30 : null)],
+    ['dura', 'Dura', true, g => g.cobertura],
+    ['clientes', 'Clientes previstos', true, g => g.clientesPrevistos || null],
+    ['precisa', 'Precisa', true, g => g.necessidade || null],
+    ['comprar', 'Comprar', true, g => g.comprar || null],
+    ['custo', 'Custo do pedido', true, g => (g.comprar && g.custoUnit ? g.custoUnit * g.comprar : null)],
+    ['vendido', 'Vendido 12 meses', true, g => g.valor12 || null],
+    ['tendencia', 'Tendência', true, g => g.tendencia]
+  ];
+  const cabecalhoCompras = () => COLUNAS.map(c => {
+    const ativo = fc.col === c[0], seta = ativo ? (fc.dir === 'desc' ? ' ▼' : ' ▲') : '';
+    return '<th class="ordenavel' + (c[2] ? ' num' : '') + (ativo ? ' ativo' : '') + '" data-acao="compras-coluna" data-id="' + c[0] + '" title="Ordenar por ' + esc(c[1]) + ' (clique de novo para inverter)"' +
+      (ativo ? ' aria-sort="' + (fc.dir === 'desc' ? 'descending' : 'ascending') + '"' : '') + '>' + esc(c[1]) + seta + '</th>';
+  }).join('');
+  function filtraProdutos(c) {
+    const q = R.normaliza(fc.busca);
+    let l = c.produtos.filter(g => {
+      if (fc.curva && g.classe !== fc.curva) return false;
+      if (fc.fornecedor && (fc.fornecedor === '-' ? g.fornecedor : g.fornecedor !== fc.fornecedor)) return false;
+      if (fc.linha && g.linha !== fc.linha) return false;
+      if (q && R.normaliza(g.descricao).indexOf(q) === -1 && String(g.codigo || '').indexOf(fc.busca.trim()) === -1) return false;
+      if (fc.mostrar === 'comprar') return g.comprar > 0;
+      if (fc.mostrar === 'falta') return g.emFalta;
+      if (fc.mostrar === 'parado') return g.parado;
+      if (fc.mostrar === 'minimo') return g.minimo > 0 && !g.inativo && (g.saldo || 0) + (g.pedido || 0) < g.minimo;
+      if (fc.mostrar === 'pedidos') return g.pedido > 0;
+      if (fc.mostrar === 'vendidos') return g.valor12 > 0;
+      return true;
+    });
+    const custoPedido = g => (g.custoUnit ? g.custoUnit * (g.comprar || 0) : 0);
+    const valorParado = g => (g.saldo > 0 && g.custoUnit ? g.saldo * g.custoUnit : 0);
+    // Clique no cabeçalho: ordena por aquela coluna; clicar de novo inverte (como no Excel).
+    if (fc.col) {
+      const v = COLUNAS.find(x => x[0] === fc.col);
+      if (v) {
+        const f = v[3], dir = fc.dir === 'desc' ? -1 : 1;
+        return l.sort((a, b) => {
+          const x = f(a), y = f(b);
+          if (x == null && y == null) return 0;
+          if (x == null) return 1; if (y == null) return -1; // vazio sempre no fim
+          return (typeof x === 'string' ? x.localeCompare(y, 'pt-BR') : x - y) * dir;
+        });
+      }
+    }
+    const ord = {
+      curva: (a, b) => OC[a.classe] - OC[b.classe] || b.valor12 - a.valor12,
+      pedido: (a, b) => custoPedido(b) - custoPedido(a),
+      dura: (a, b) => (a.cobertura == null ? 1e9 : a.cobertura) - (b.cobertura == null ? 1e9 : b.cobertura),
+      vendido: (a, b) => b.valor12 - a.valor12,
+      parado: (a, b) => valorParado(b) - valorParado(a),
+      nome: (a, b) => String(a.descricao).localeCompare(String(b.descricao), 'pt-BR')
+    }[fc.ordem] || ((a, b) => 0);
+    return l.sort(ord);
+  }
+
+  const LIMITE_COMPRAS = 400;
+  CRM.telas.compras = {
+    render() {
+      if (!CRM.ehAdmin() && !CRM.ehComprador()) return '<div class="cartao"><p class="vazio">Esta tela é do administrador e do comprador.</p></div>';
+      const hoje = CRM.hoje(), cfg = E().cfg;
+      if (estoque === null) setTimeout(carregaEstoque, 0);
+      const c = G.compras(E().D, E().ix, cfg, hoje, diasCompras, estoque || [], extra);
+      const e = c.estoque;
+      const l = filtraProdutos(c);
+      ultimo = Object.assign({}, ultimo || {}, { c, filtrados: l });
+      CRM.comprasAtual = () => (estoque ? c : null); // a oferta de queima de estoque (ofertas.js) monta a partir daqui
+      CRM.comprasRecarregar = () => { estoque = null; }; // pedido ao fornecedor registrado (compras-pedidos.js): refaz a sugestão
+      const botao = '<label class="btn sec arquivo" title="No FKN: Listagem cadastral de produtos (SIFN108), salvar em CSV. O CSV simples de estoque também serve.">Atualizar estoque (listagem do FKN)<input type="file" id="gEstoque" accept=".csv,.txt,text/csv"></label>';
+      const velho = e && e.em && R.diasEntre(R.diaLocal(e.em), hoje) > 3;
+      const curva = g => (g.classe === '—' ? '<small>—</small>' : CRM.selo(g.classe, g.classe === 'A' ? 'verde' : g.classe === 'B' ? 'azul' : 'etiqueta'));
+      const custo = g => (g.comprar && g.custoUnit ? R.moeda(g.custoUnit * g.comprar) : '—');
+      const lemb = CRM.lembreteFkn ? CRM.lembreteFkn() : [];
+      const recs = CRM.recusasFkn ? CRM.recusasFkn() : [];
+      const quandoFkn = v => (v ? esc(R.dataBR(R.diaLocal(v)) + ' ' + R.horaLocal(v)) : 'nunca');
+      const NOME_REC = { produtos: 'A listagem de produtos', receber: 'O contas a receber', pagar: 'O contas a pagar' };
+      const faixaFkn = (lemb.length || recs.length ? '<div class="faixa alerta lembrete-fkn">' +
+        (lemb.length ? '<p><strong>Hora de puxar ' + (lemb.length > 1 ? 'os relatórios' : 'o relatório') + ' do FKN (' + esc(lemb[0].turno) + '):</strong> ' +
+          lemb.map(x => esc(x.arquivo) + ' <small>(último: ' + quandoFkn(x.ultimo) + ')</small>').join(' · ') + '.</p>' : '') +
+        recs.map(r => '<p><strong>' + esc(NOME_REC[r.tipo] || 'O relatório') + ' salvo em ' + quandoFkn(r.quando) + ' foi recusado</strong> (nada foi trocado): ' + esc(r.texto) + '. Gere de novo e salve na pasta.</p>').join('') +
+        '</div>' : '') + (lemb.length || recs.length ? colinhaFkn(cfg, true, recs) : '');
+      return faixaFkn + '<div class="cabecalho"><div><h1>Compras</h1><p class="sub">' +
+          (e ? 'Estoque do FKN de <strong>' + esc(R.dataBR(e.em) + ' ' + R.horaLocal(e.em)) + '</strong>' + (velho ? ' ' + CRM.selo('desatualizado: exporte de novo no FKN', 'ambar') : '') + ' · ' + e.produtos + ' produtos'
+            : 'Sem estoque do FKN ainda: exporte a posição de estoque em CSV no FKN e clique em "Atualizar estoque"') +
+          '</p></div><span class="flex"></span>' + botao + '</div>' +
+        (e ? '<section class="kpis">' +
+          kpi('Estoque a custo', R.moeda(e.valor), (e.negativos ? e.negativos + ' com saldo negativo no FKN' : 'saldo positivo'), 'azul') +
+          kpi('Sugestão de pedido', R.moeda(e.valorSugestao), c.sugestao.length + ' produtos para ' + c.dias + ' dias' + (e.semCusto ? ' · ' + e.semCusto + ' sem custo' : ''), 'verde', 'compras-kpi', 'comprar') +
+          kpi('Em falta', String(c.ruptura.length), 'vendeu em 90 dias e está zerado', c.ruptura.length ? 'vermelho' : '', 'compras-kpi', 'falta') +
+          kpi('Estoque parado', R.moeda(e.valorParado), c.parado.length + ' produtos sem venda em 90 dias', '', 'compras-kpi', 'parado') +
+          kpi('Curva A', String(c.abc.A.length), 'produtos que fazem 80% do faturamento', '', 'compras-kpi', 'A') +
+        '</section>' : '') + (e ? painelComprador(c) : '') + (CRM.ofertas ? CRM.ofertas.botaoCompras(c) : '') +
+        '<section class="cartao"><div class="filtros-compras">' +
+          '<input type="search" id="cBusca" placeholder="Pesquisar produto ou código" value="' + esc(fc.busca) + '" aria-label="Pesquisar produto ou código">' +
+          '<select id="cMostrar" aria-label="O que mostrar">' + CRM.opcoesHTML(MOSTRAR, fc.mostrar) + '</select>' +
+          '<select id="cCurva" aria-label="Curva">' + CRM.opcoesHTML([['', 'Todas as curvas'], ['A', 'Curva A'], ['B', 'Curva B'], ['C', 'Curva C']], fc.curva) + '</select>' +
+          (c.listas.fornecedores.length ? '<select id="cFornecedor" aria-label="Fornecedor">' + CRM.opcoesHTML([['', 'Todos os fornecedores']].concat(c.listas.fornecedores.map(f => [f, f]), [['-', 'Sem fornecedor no FKN']]), fc.fornecedor) + '</select>' : '') +
+          (c.listas.linhas.length ? '<select id="cLinha" aria-label="Linha">' + CRM.opcoesHTML([['', 'Todas as linhas']].concat(c.listas.linhas.map(f => [f, f])), fc.linha) + '</select>' : '') +
+          '<select id="gDias" aria-label="Prazo">' + CRM.opcoesHTML([['15', 'Para 15 dias'], ['30', 'Para 30 dias'], ['45', 'Para 45 dias'], ['60', 'Para 60 dias'], ['90', 'Para 90 dias']], String(c.dias)) + '</select>' +
+          '<select id="cOrdem" aria-label="Ordenar">' + CRM.opcoesHTML(ORDEM, fc.ordem) + '</select>' +
+          '<button type="button" class="btn sec" data-acao="compras-colunas" title="Mostrar ou esconder Mín. FKN, Clientes previstos, Precisa, Vendido 12 meses e Tendência">' + (todasColunas ? 'Só as colunas principais' : 'Todas as colunas') + '</button>' +
+          '<button type="button" class="btn sec" data-acao="compras-exportar" title="Baixa uma planilha (abre no Excel) com os produtos que estão na tabela, com estes filtros">Baixar planilha (' + l.length + ' produtos)</button>' +
+        '</div>' +
+        '<p class="dica">Precisa = o maior entre o que os clientes devem pedir (pelo ritmo e pelos itens de sempre) e o consumo médio dos últimos 90 dias no prazo. ' +
+          'Comprar = precisa + o que sai até o pedido chegar (prazo do fornecedor; 7 dias sem cadastro) − estoque − o que já foi pedido (no mínimo o estoque mínimo do FKN). O estoque do FKN já desconta o reservado para cliente, e a caixa fechada entra em unidades. ✱ = fornecedor trocado no CRM.' +
+          (e && !e.completo ? ' <strong>Para ter fornecedor, mínimo e pedidos em aberto, use a Listagem cadastral de produtos do FKN (SIFN108) em CSV.</strong>' : '') + '</p>' +
+        (l.length ? '<div class="tabela-rolagem tabela-fixa"><table class="tabela compras' + (todasColunas ? '' : ' enxuta') + '"><thead><tr>' + cabecalhoCompras() + '</tr></thead><tbody>' +
+          l.slice(0, LIMITE_COMPRAS).map(g => '<tr><td>' + esc(R.nomeDeItem(g.descricao)) + ' <small>' + esc(g.codigo || '') + '</small>' + (g.inativo ? ' ' + CRM.selo('inativo no FKN', 'etiqueta') : '') + '</td>' +
+            '<td class="forn" title="' + esc(g.fornecedor || '') + '"><small>' + esc(g.fornecedor || '—') + (g.fornecedorTrocado ? ' ✱' : '') + '</small>' +
+              (g.codigo && g.saldo != null ? ' <button type="button" class="mini" data-acao="compras-troca-forn" data-id="' + esc(g.codigo) + '" title="' + (g.fornecedor ? 'Trocar o fornecedor deste produto' : 'Dizer de qual fornecedor se compra') + '">✎</button>' : '') + '</td><td>' + curva(g) + '</td>' +
+            '<td class="num">' + (g.saldo == null ? '—' : g.saldo < 0 ? CRM.selo(qtd(g.saldo), 'vermelho') : qtd(g.saldo)) + ' <small>' + esc(g.unidade) + '</small>' +
+              (g.caixa && g.caixa.saldo > 0 ? '<br><small>= ' + qtd(g.caixa.saldo) + ' cx de ' + g.caixa.fator + (g.saldo - g.caixa.saldo * g.caixa.fator > 0 ? ' + ' + qtd(g.saldo - g.caixa.saldo * g.caixa.fator) : '') + '</small>' : '') + '</td>' +
+            '<td class="num">' + (g.minimo ? qtd(g.minimo) : '—') + '</td><td class="num">' + (g.pedido ? qtd(g.pedido) : '—') + '</td>' +
+            '<td class="num">' + (g.consumoDia ? qtd(g.consumoDia * 30) : '—') + '</td>' +
+            '<td class="num">' + (g.cobertura == null ? '—' : g.cobertura < 1 ? CRM.selo('acabou', 'vermelho') : Math.round(g.cobertura) + ' dias') + '</td>' +
+            '<td class="num">' + (g.clientesPrevistos || '—') + '</td><td class="num">' + (g.necessidade ? qtd(g.necessidade) : '—') + '</td>' +
+            '<td class="num">' + (g.comprar ? '<strong>' + g.comprar + '</strong>' + (g.caixas ? '<br><small>' + g.caixas + ' cx de ' + g.caixa.fator + '</small>' : '') + (g.pelaMinimo ? '<br><small>pelo mínimo</small>' : '') : '—') + '</td><td class="num">' + esc(custo(g)) + '</td>' +
+            '<td class="num">' + (g.valor12 ? esc(R.moeda(g.valor12)) : '—') + '</td><td class="num">' + (g.tendencia == null ? '—' : seta(g.tendencia)) + '</td></tr>').join('') +
+          '</tbody></table></div>' + (l.length > LIMITE_COMPRAS ? '<p class="mais">Mostrando ' + LIMITE_COMPRAS + ' de ' + l.length + '; o arquivo exportado tem todos.</p>' : '')
+          : '<p class="vazio">Nenhum produto com esses filtros.</p>') + '</section>' +
+        cartaoPorFornecedor(c) +
+        '<div class="g-duas">' +
+          '<section class="cartao"><h2>Clientes com compra prevista <small>' + c.clientesPrevistos.length + ' até ' + esc(R.dataBR(R.somaDias(hoje, c.dias))) + '</small></h2>' +
+            (c.clientesPrevistos.length ? '<ul class="g-tend">' + c.clientesPrevistos.slice(0, 15).map(x => '<li><span>' + esc(x.empresa.nome) + '</span><strong>' + esc(R.dataBR(x.proxima)) + '</strong><small>' +
+              (x.proxima < hoje ? 'já passou da data · ' : '') + x.itens + ' item(ns) de sempre</small></li>').join('') + '</ul>' + (c.clientesPrevistos.length > 15 ? '<p class="mais">e mais ' + (c.clientesPrevistos.length - 15) + '…</p>' : '')
+              : '<p class="vazio">Nenhum cliente com ritmo de compra no prazo.</p>') + '</section>' +
+          '<section class="cartao"><h2>Tendência <small>últimos 90 dias × 90 anteriores</small></h2>' +
+            '<h3>Em alta</h3>' + listaTendencia(c.emAlta) + '<h3>Em queda</h3>' + listaTendencia(c.emQueda) + '</section>' +
+        '</div>' + (lemb.length || recs.length ? '' : colinhaFkn(cfg, false, recs)); // sem aviso: a colinha fica fechada no fim
+    },
+    depois() {
+      const arq = document.getElementById('gEstoque');
+      if (arq) arq.addEventListener('change', () => { const f = arq.files[0]; if (f) importaEstoque(f).catch(CRM.falhou); });
+      const liga = (id, campo, num) => { const el = document.getElementById(id); if (el) el.addEventListener(el.tagName === 'INPUT' ? 'input' : 'change', () => { if (num) diasCompras = +el.value || 30; else fc[campo] = el.value;
+        // Ordem que faz sentido para cada visão (dá para trocar depois).
+        if (campo === 'mostrar') fc.ordem = { comprar: 'curva', falta: 'vendido', parado: 'parado', vendidos: 'vendido', todos: 'nome' }[el.value] || fc.ordem;
+        CRM.render(); }); };
+      liga('cBusca', 'busca'); liga('cMostrar', 'mostrar'); liga('cCurva', 'curva'); liga('cFornecedor', 'fornecedor'); liga('cLinha', 'linha'); liga('cOrdem', 'ordem'); liga('gDias', null, true);
+      ['cOrdem', 'cMostrar'].forEach(id => { const el = document.getElementById(id); if (el) el.addEventListener('change', () => { fc.col = null; }, true); });
+    }
+  };
+
+  async function importaEstoque(f) {
+    const buf = await f.arrayBuffer();
+    let txt = new TextDecoder('utf-8').decode(buf);
+    if (txt.indexOf('�') !== -1) txt = new TextDecoder('windows-1252').decode(buf); // CSV do FKN é Windows-1252
+    // Listagem do FKN puxada com opção faltando: recusa (mesma conferência do vigia).
+    if (G.ehListagemProdutos(txt)) { const conf = K.conferirListagemProdutos(txt); if (conf.recusa.length) throw new Error('Arquivo recusado, nada foi trocado: ' + conf.recusa.join('; ') + '. Veja a colinha no fim de Compras.'); }
+    const lista = G.lerArquivoEstoque(txt);
+    const neg = lista.filter(x => x.quantidade < 0).length;
+    CRM.toast('Gravando o estoque: ' + lista.length + ' produtos…');
+    const n = await CRM.store().salvarEstoque(lista, (i, tot) => CRM.toast('Gravando o estoque: ' + i + ' de ' + tot + '…'));
+    // estoque do CRM (16/10/2026): a hora da listagem e a conferência CRM × FKN, como no vigia
+    let conf = null;
+    if (G.ehListagemProdutos(txt) && CRM.store().estoqueFoto) conf = await CRM.store().estoqueFoto(K.posicaoListagem(txt), n).catch(() => null);
+    const c = conf && conf.conferencia;
+    CRM.toast('Estoque atualizado: ' + n + ' produtos' + (neg ? ' (' + neg + ' com saldo negativo no FKN)' : '') +
+      (c ? ' · estoque CRM × FKN: ' + c.diferentes + ' diferença(s), ' + c.sem_explicacao + ' sem explicação' : '') + '.');
+    estoque = null; CRM.render();
+    if (CRM.recarregarFkn) CRM.recarregarFkn();
+  }
+
+  // Colinha para puxar os dois relatórios no FKN (passo a passo + checklist). Abre sozinha quando
+  // há lembrete ou recusa; fica fechada no resto do tempo. O vigia confere o arquivo e recusa o
+  // que vier com opção faltando (fkn.js → conferir*), mas o checklist evita o vai e volta.
+  function colinhaFkn(cfg, abrir, recs) {
+    const pasta = esc(cfg.pasta_fkn || 'pasta que o vigia olha');
+    const marca = (tipo, txt) => (recs || []).some(r => r.tipo === tipo) ? '<strong>' + txt + '</strong>' : txt;
+    const lista = itens => '<ul class="checklist">' + itens.map(t => '<li>☐ ' + t + '</li>').join('') + '</ul>';
+    const admin = CRM.ehAdmin(); // o contas a receber é só do administrador; o comprador puxa só o estoque
+    return '<details class="cartao colinha-fkn"' + (abrir ? ' open' : '') + '><summary><h2>Colinha: como puxar ' + (admin ? 'os três relatórios' : 'o relatório de estoque') + ' do FKN <small>manhã e tarde · salvar em ' + pasta + '</small></h2></summary>' +
+      '<div class="g-duas">' +
+      '<section>' + marca('produtos', '<h3>1. Listagem cadastral de produtos</h3>') + '<ol>' +
+        '<li>No SIFWin: <strong>Cadastros → Produto → Listagens → Listagem cadastral</strong>.</li>' +
+        '<li>Listagem <strong>Padrão</strong> · Ordem <strong>Código</strong> · Unidade <strong>Geral</strong> · Separação <strong>Nenhuma</strong>.</li>' +
+        '<li>Em <strong>Listar dados</strong>, marcar os seis: Estoque/pendências, Índices/preços, Fornecedor, Movimentação (datas), Venda média (6 meses) e Localização.</li>' +
+        '<li>Situação <strong>0</strong> (todos); linha, família e fornecedor em branco.</li>' +
+        '<li><strong>OK</strong> → no relatório, o <strong>disquete</strong> → <strong>Tudo</strong> → tipo <strong>CSV</strong> → salvar em <code>' + pasta + '</code> (pode substituir o antigo).</li></ol>' +
+        '<p class="dica">Checklist antes de salvar:</p>' + lista(['empresa/filial a de sempre (o nome no topo do relatório é o mesmo da última vez)', 'os seis itens de "Listar dados" marcados',
+          'nenhuma linha, família ou fornecedor filtrado; situação 0', 'salvo com "Tudo" (não só a página) e em CSV, não XLS', 'na pasta ' + pasta]) + '</section>' +
+      (admin ? '<section>' + marca('receber', '<h3>2. Contas a receber por cliente</h3>') + '<ol>' +
+        '<li>No SIFWin: <strong>Contas a Receber → Relatórios → Por cliente</strong>.</li>' +
+        '<li>Cliente <strong>0</strong> (todos) · Portador <strong>0</strong> · Situação <strong>GERAL</strong> · Filial: a de sempre (todas, se tiver a opção).</li>' +
+        '<li>Listar títulos: <strong>Em aberto</strong> (vencidos e a vencer). Período de vencimento <strong>em branco</strong>.</li>' +
+        '<li>Marcar <strong>"Listar os dados cadastrais dos clientes"</strong> (traz o CNPJ, que liga o título ao cliente).</li>' +
+        '<li><strong>OK</strong> → <strong>disquete</strong> → <strong>Tudo</strong> → <strong>CSV</strong> → salvar em <code>' + pasta + '</code>.</li></ol>' +
+        '<p class="dica">Checklist antes de salvar:</p>' + lista(['"Em aberto" (não liquidados, não geral)', 'período de vencimento em branco', '"Listar os dados cadastrais dos clientes" marcado',
+          'cliente 0, portador 0, situação GERAL, filial de sempre', 'tem o TOTAL GERAL no fim (salvo com "Tudo"), em CSV', 'na pasta ' + pasta]) + '</section>' : '') +
+      (admin ? '<section>' + marca('pagar', '<h3>3. Contas a pagar por conta/fornecedor</h3>') + '<ol>' +
+        '<li>No SIFWin: relatório <strong>Sifn083 — Contas à Pagar por Conta/Fornecedor</strong>.</li>' +
+        '<li>Conta <strong>0</strong> a <strong>0</strong> · Subconta <strong>0</strong> · Situação <strong>GERAL</strong> · Filial: a da OneClean.</li>' +
+        '<li>Marcar <strong>"Dados conta/fornecedor"</strong>; o resto das caixinhas desmarcado.</li>' +
+        '<li>Listar títulos: <strong>Em aberto</strong> · No período: <strong>em branco</strong> · Por ordem de: <strong>Data de vencimento</strong>.</li>' +
+        '<li><strong>OK</strong> → <strong>disquete</strong> → <strong>Tudo</strong> → <strong>CSV</strong> → salvar em <code>' + pasta + '</code>.</li></ol>' +
+        '<p class="dica">Checklist antes de salvar:</p>' + lista(['"Em aberto"', 'período em branco (as duas datas)', 'conta 0 a 0, situação GERAL, filial de sempre',
+          'tem o TOTAL GERAL no fim (salvo com "Tudo"), em CSV', 'na pasta ' + pasta]) + '</section>' : '') +
+      '</div><p class="dica">Em 1 ou 2 minutos o vigia manda ao CRM e o aviso some. Se faltar alguma opção, o CRM recusa o arquivo, não troca nada e o aviso diz o que marcar.</p></details>';
+  }
+
+  // Pedido por fornecedor: a sugestão de compra separada por fornecedor, pronta para mandar, com o cadastro do
+  // fornecedor (prazo, pedido mínimo, frete, dia de pedido). Embaixo, todos os fornecedores para o comprador cadastrar.
+  const DIAS = ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sáb'];
+  const fretePor = f => (!f ? '' : f.frete === 'cif' ? 'CIF' : f.frete === 'fob' ? 'FOB' : f.frete === 'cif_acima' ? 'CIF acima de ' + R.moeda(f.frete_cif_acima) : '');
+  function cartaoPorFornecedor(c) {
+    const l = c.pedidoPorFornecedor || [];
+    const todos = c.todosFornecedores || [];
+    if (!c.estoque || !c.estoque.completo) return '';
+    const cad = todos.filter(f => f.cadastro).length;
+    return '<section class="cartao" id="comprasPorForn"><h2>Pedido por fornecedor <small>' + l.length + ' fornecedor(es) · ' + esc(R.moeda(c.estoque.valorSugestao)) + ' para ' + c.dias + ' dias</small></h2>' +
+      (l.length ? '<div class="tabela-rolagem"><table class="tabela"><thead><tr><th>Fornecedor</th><th class="num">Produtos</th><th class="num">Custo estimado</th><th class="num">Pedido mínimo</th><th class="num">Prazo</th><th>Frete</th><th></th></tr></thead><tbody>' +
+      l.map((f, i) => '<tr><td><button type="button" class="link" data-acao="compras-ver-fornecedor" data-id="' + i + '">' + esc(f.nome) + '</button>' + (f.cod ? ' <small>' + esc(f.cod) + '</small>' : '') +
+          (f.urgentes ? ' ' + CRM.selo(f.urgentes + ' pedir hoje', 'vermelho') : '') + (f.diaDePedido ? ' ' + CRM.selo('dia de pedido', 'azul') : '') + '</td>' +
+        '<td class="num">' + f.itens.length + '</td><td class="num">' + esc(R.moeda(f.custo)) + (f.semCusto ? ' <small>' + f.semCusto + ' sem custo</small>' : '') + '</td>' +
+        '<td class="num">' + (f.pedidoMinimo ? esc(R.moeda(f.pedidoMinimo)) + (f.faltaMinimo > 0 ? '<br>' + CRM.selo('faltam ' + R.moeda(f.faltaMinimo), 'ambar') : '<br>' + CRM.selo('atingido', 'verde')) : '<small>—</small>') + '</td>' +
+        '<td class="num">' + (f.cod ? f.prazo + ' dias' + (f.prazoEstimado ? '<br><small>estimado</small>' : '') : '—') + '</td>' +
+        '<td><small>' + esc(fretePor(f.cadastro)) + (f.freteCif === true ? ' ✓' : '') + '</small></td>' +
+        '<td class="num">' + (f.cod ? '<button type="button" class="mini" data-acao="compras-forn-editar" data-id="' + esc(f.cod) + '" title="Prazo, pedido mínimo, frete, dias de pedido e contato">✎ Cadastro</button> ' : '') +
+          (CRM.comprasPedidos ? '<button type="button" class="mini" data-acao="compras-registrar" data-id="' + i + '" title="Registra o pedido no CRM: as vendedoras veem o que está a caminho e quando chega">Registrar pedido</button> ' : '') +
+          '<button type="button" class="mini" data-acao="compras-pedido-fornecedor" data-id="' + i + '" title="Planilha para lançar no FKN">Exportar para o FKN</button></td></tr>').join('') +
+      '</tbody></table></div>' : '<p class="vazio">Nada para pedir no prazo escolhido.</p>') +
+      '<details data-chave="compras-fornecedores"><summary>Cadastro dos fornecedores <small>' + cad + ' de ' + todos.length + ' preenchidos</small></summary>' +
+        '<p class="dica">Prazo de entrega (sem cadastro o CRM usa 7 dias), pedido mínimo, frete, dias em que se faz o pedido e o contato. Com isso a sugestão já conta o que sai até a mercadoria chegar e avisa quando faltar para o mínimo.</p>' +
+        '<p><button type="button" class="btn sec" data-acao="compras-forn-editar" data-id="">+ Fornecedor que não está no FKN</button></p>' +
+        '<div class="tabela-rolagem"><table class="tabela"><thead><tr><th>Fornecedor</th><th class="num">Produtos</th><th class="num">Prazo</th><th class="num">Pedido mínimo</th><th>Frete</th><th>Dias de pedido</th><th>Contato</th><th></th></tr></thead><tbody>' +
+        todos.map(f => { const k = f.cadastro || {};
+          return '<tr' + (f.naoCompramos ? ' class="apagado"' : '') + '><td>' + esc(f.nome) + ' <small>' + esc(f.cod) + '</small>' + (f.naoCompramos ? ' ' + CRM.selo('não compramos', 'etiqueta') : '') + '</td><td class="num">' + f.produtos + '</td>' +
+            '<td class="num">' + (f.cadastro ? k.prazo_dias + ' dias' : '<small>7 (estimado)</small>') + '</td><td class="num">' + (num(k.pedido_minimo) ? esc(R.moeda(k.pedido_minimo)) : '—') + '</td>' +
+            '<td><small>' + esc(fretePor(f.cadastro) || '—') + '</small></td><td><small>' + esc((k.dias_pedido || []).map(d => DIAS[d]).join(', ') || '—') + '</small></td>' +
+            '<td><small>' + esc([k.contato, k.telefone].filter(Boolean).join(' · ') || '—') + '</small></td>' +
+            '<td class="num"><button type="button" class="mini" data-acao="compras-forn-editar" data-id="' + esc(f.cod) + '">✎</button></td></tr>'; }).join('') +
+        '</tbody></table></div></details></section>';
+  }
+
+  // Painel do comprador: o que pedir hoje, o preço de compra que subiu, o que vende sem fornecedor e a análise pela IA.
+  function painelComprador(c) {
+    const ph = c.pedirHoje || [], cs = c.custoSubiu || [], sf = c.semFornecedor || [];
+    const temIA = CRM.turma && CRM.turma.perguntar && CRM.store().assistente;
+    const an = CRM.turma && CRM.turma.analise ? CRM.turma.analise() : null, gerando = CRM.gerandoAnalise && CRM.gerandoAnalise();
+    const blocoIA = temIA && CRM.store().analiseCompras ? '<div class="analise-ia"><h3>🧠 Análise de compras de hoje' + (an && an.em ? ' <small>feita às ' + esc(new Date(an.em).toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' })) + '</small>' : '') + '</h3>' +
+      (gerando ? '<p class="cob-lendo">O comprador sênior está olhando a reposição, os fornecedores, as notas de compra, o custo e o estoque parado…</p>'
+        : an && an.texto ? '<div class="analise-texto">' + CRM.turma.fmt(an.texto) + '</div>' : '<p class="vazio">Ainda não feita hoje.</p>') +
+      '<p class="acoes">' + (!gerando ? '<button type="button" class="btn' + (an && an.texto ? ' sec' : '') + '" data-acao="compras-analise-gerar">' + (an && an.texto ? '↻ Refazer agora' : 'Fazer a análise de hoje') + '</button> ' : '') +
+        '<button type="button" class="btn sec" data-acao="compras-analise">💬 Conversar com o comprador sênior</button></p></div>' : '';
+    return '<section class="cartao painel-comprador"><h2>Painel do comprador <small>o que precisa da sua atenção hoje</small></h2>' +
+      '<div class="painel-topo">' + blocoIA + pendenciasCompra(c) + '</div>' +
+      '<p class="acoes">' +
+        (CRM.telas.concorrentes ? '<button type="button" class="btn sec" data-acao="aba" data-id="concorrentes">⚖ Comparar com os concorrentes</button> ' : '') +
+        (temIA ? '<small class="dica">a IA olha a reposição, os fornecedores, o estoque parado e os preços dos concorrentes</small>' : '') + '</p>' +
+      '<div class="g-tres">' +
+      '<div><h3>Pedir hoje <small>' + ph.length + '</small></h3>' + (ph.length ? '<ul class="g-tend">' + ph.slice(0, 8).map(f => '<li><span>' + esc(f.nome) + '</span><strong>' + esc(R.moeda(f.custo)) + '</strong><small>' +
+          [f.urgentes ? f.urgentes + ' produto(s) acabam antes da entrega (' + f.prazo + ' dias)' : '', f.diaDePedido ? 'hoje é dia de pedido' : '', f.faltaMinimo > 0 ? 'faltam ' + R.moeda(f.faltaMinimo) + ' para o mínimo' : ''].filter(Boolean).map(esc).join(' · ') +
+          '</small></li>').join('') + '</ul>' + (ph.length > 8 ? '<p class="mais">e mais ' + (ph.length - 8) + ' no pedido por fornecedor, abaixo.</p>' : '') : '<p class="vazio">Nenhum fornecedor com produto acabando antes da entrega.</p>') + '</div>' +
+      '<div><h3>Preço de compra subiu <small>60 dias, 3% ou mais</small></h3>' + (cs.length ? '<ul class="g-tend">' + cs.slice(0, 8).map(x => '<li><span>' + esc(R.nomeDeItem(x.descricao)) + '</span>' +
+          '<strong>+' + esc(R.pct(x.pct)) + '</strong><small>' + esc(R.moeda(x.de) + ' → ' + R.moeda(x.para) + ' · ' + R.dataBR(R.diaLocal(x.em)) + (x.fornecedor ? ' · ' + x.fornecedor : '') + (x.precoVenda ? ' · venda ' + R.moeda(x.precoVenda) : '')) + '</small></li>').join('') + '</ul>'
+          : '<p class="vazio">Nenhuma alta de custo nas listagens do FKN desde que o CRM passou a guardar (18/10).</p>') + '</div>' +
+      '<div><h3>Vende e não tem fornecedor <small>' + sf.length + '</small></h3>' + (sf.length ? '<p>Vendidos nos últimos 90 dias sem fornecedor: a sugestão deles não vira pedido.</p>' +
+          '<ul class="g-tend">' + sf.slice(0, 5).map(g => '<li><span>' + esc(R.nomeDeItem(g.descricao)) + '</span><button type="button" class="mini" data-acao="compras-troca-forn" data-id="' + esc(g.codigo) + '">definir</button><small>' + esc(g.codigo + (g.valor12 ? ' · ' + R.moeda(g.valor12) + ' em 12 meses' : '') + (g.fornecedorNoFkn ? ' · no FKN: ' + R.nomeDeItem(g.fornecedorNoFkn) + ' (não compramos)' : '')) + '</small></li>').join('') + '</ul>' +
+          '<p><button type="button" class="link" data-acao="compras-sem-forn">ver todos na tabela</button></p>' : '<p class="vazio">Todo produto que vende tem fornecedor.</p>') + '</div>' +
+      '</div></section>';
+  }
+
+  // Pendências do comprador ao lado da análise (19/10/2026, pedido do Anderson: "trazer as pendências… dar um
+  // destaque para não esquecer"): notas de compra para dar entrada (as que já chegaram), despesa para tirar da lista,
+  // notas da Sefaz sem ciência e os fornecedores para pedir hoje.
+  function pendenciasCompra(c) {
+    const p = extra.pend, S = raiz.CRMEstoque, ph = c.pedirHoje || [];
+    const li = (acao, id, texto, sub, cor) => '<li><button type="button" class="link' + (cor ? ' ' + cor : '') + '" data-acao="' + acao + '" data-id="' + esc(id) + '">' + esc(texto) + '</button>' + (sub ? '<small>' + esc(sub) + '</small>' : '') + '</li>';
+    const itens = [];
+    if (p && p.compras.length && S) {
+      const fknForn = [];
+      const vistos = new Set();
+      (estoque || []).forEach(x => { if (x.fornecedor_cod && x.fornecedor && !vistos.has(x.fornecedor_cod)) { vistos.add(x.fornecedor_cod); fknForn.push({ cod: x.fornecedor_cod, nome: x.fornecedor }); } });
+      (extra.fornecedores || []).forEach(f => fknForn.push({ cod: f.codigo, nome: f.nome }));
+      const desp = p.compras.filter(n => S.pareceDespesa(p.itensPend.filter(i => i.compra_id === n.id)));
+      const merc = p.compras.filter(n => desp.indexOf(n) === -1);
+      const ch = S.chegadaCompras({ compras: merc, itensProd: p.itensProd, fkn: estoque, fknForn });
+      const chegou = merc.filter(n => { const x = ch.get(n.id); return x && (x.estado === 'chegou' || x.estado === 'provavel'); }).length;
+      if (merc.length) itens.push(li('turma-ir', 'estoque:compras', '📥 ' + merc.length + (merc.length === 1 ? ' nota de compra' : ' notas de compra') + ' para dar entrada',
+        (chegou ? chegou + (chegou === 1 ? ' já chegou' : ' já chegaram') + ' · ' : '') + (merc.length - chegou) + ' aguardando a mercadoria', chegou ? 'forte' : ''));
+      if (desp.length) itens.push(li('turma-ir', 'estoque:compras', '💡 ' + desp.length + (desp.length === 1 ? ' nota parece despesa' : ' notas parecem despesa') + ': tirar da lista', desp.map(n => n.fornecedor_nome).slice(0, 2).join(', ')));
+    }
+    if (p && p.semCiencia) itens.push(li('turma-ir', 'estoque:compras', '📨 ' + p.semCiencia + (p.semCiencia === 1 ? ' nota da Sefaz' : ' notas da Sefaz') + ' sem ciência', 'dar quando a mercadoria chegar (o XML vem depois)'));
+    if (ph.length) itens.push(li('compras-ir-pedido', '', '🛒 Pedir hoje: ' + ph.length + (ph.length === 1 ? ' fornecedor' : ' fornecedores') + ' · ' + R.moeda(ph.reduce((s, f) => s + f.custo, 0)),
+      ph.slice(0, 3).map(f => f.nome).join(', ') + (ph.length > 3 ? '…' : ''), 'forte'));
+    return '<div class="pend-compras"><h3>📌 Pendências</h3>' + (itens.length ? '<ul>' + itens.join('') + '</ul>' : '<p class="vazio">Nada pendente nas compras.</p>') + '</div>';
+  }
+
+  function formFornecedor(cod) {
+    const c = ultimo && ultimo.c, t = c ? (c.todosFornecedores || []).find(f => f.cod === cod) : null;
+    const k = (t && t.cadastro) || {}, novo = !cod;
+    const dias = (k.dias_pedido || []).map(Number);
+    const campos = [
+      { nome: 'codigo', rotulo: 'Código', obrigatorio: true, desabilitado: !novo, dica: novo ? 'o código do fornecedor no FKN, se tiver' : '' },
+      { nome: 'nome', rotulo: 'Nome', obrigatorio: true, largo: true },
+      { nome: 'prazo_dias', rotulo: 'Prazo de entrega (dias corridos)', tipo: 'numero', obrigatorio: true, min: 0, max: 180 },
+      { nome: 'pedido_minimo', rotulo: 'Pedido mínimo (R$)', tipo: 'numero', min: 0 },
+      { nome: 'frete', rotulo: 'Frete', tipo: 'select', opcoes: [['', '—'], ['cif', 'CIF (o fornecedor paga)'], ['fob', 'FOB (nós pagamos)'], ['cif_acima', 'CIF acima de um valor']] },
+      { nome: 'frete_cif_acima', rotulo: 'CIF a partir de (R$)', tipo: 'numero', min: 0 },
+      { nome: 'secao_dias', tipo: 'secao', rotulo: 'Dias em que se faz o pedido' }
+    ].concat([1, 2, 3, 4, 5, 6].map(d => ({ nome: 'dia_' + d, rotulo: DIAS[d], tipo: 'checkbox' })), [
+      { nome: 'pagamento', rotulo: 'Condição de pagamento', dica: 'ex.: 28 dias boleto' },
+      { nome: 'contato', rotulo: 'Contato (vendedor do fornecedor)' }, { nome: 'telefone', rotulo: 'Telefone / WhatsApp' }, { nome: 'email', rotulo: 'E-mail' },
+      { nome: 'cnpj', rotulo: 'CNPJ' }, { nome: 'ativo', rotulo: 'Ainda compramos deste fornecedor', tipo: 'checkbox', dica: 'desmarcado, os produtos dele no FKN ficam em "Vende e não tem fornecedor" até dizer de quem compra' },
+      { nome: 'obs', rotulo: 'Observações', tipo: 'textarea', largo: true }]);
+    const valores = Object.assign({ codigo: cod || '', nome: (t && t.nome) || '' }, k, { prazo_dias: k.prazo_dias != null ? k.prazo_dias : 7, ativo: k.ativo !== false });
+    [1, 2, 3, 4, 5, 6].forEach(d => { valores['dia_' + d] = dias.includes(d); });
+    CRM.abrirForm({ titulo: novo ? 'Novo fornecedor' : 'Fornecedor: ' + ((t && t.nome) || cod), largura: 'largo', campos, valores,
+      intro: 'O prazo entra na sugestão de compra (o que sai até a mercadoria chegar); o pedido mínimo e o frete aparecem no pedido por fornecedor.',
+      aoSalvar: async v => {
+        const f = { codigo: novo ? String(v.codigo).trim() : cod, nome: String(v.nome).trim(), prazo_dias: Math.round(v.prazo_dias), pedido_minimo: v.pedido_minimo || null,
+          frete: v.frete || null, frete_cif_acima: v.frete === 'cif_acima' ? v.frete_cif_acima || null : null,
+          dias_pedido: [1, 2, 3, 4, 5, 6].filter(d => v['dia_' + d]), pagamento: v.pagamento || null, contato: v.contato || null, telefone: v.telefone || null,
+          email: v.email || null, cnpj: v.cnpj || null, obs: v.obs || null, ativo: !!v.ativo };
+        await CRM.store().salvarFornecedor(f);
+        CRM.toast('Fornecedor salvo.'); estoque = null; CRM.render();
+      } });
+  }
+  function formTrocaForn(codigo) {
+    const c = ultimo && ultimo.c, g = c ? c.produtos.find(x => x.codigo === codigo) : null;
+    const atual = g && g.fornecedorTrocado ? g.fornecedorCod : null;
+    const todos = ((c && c.todosFornecedores) || []).filter(f => !f.naoCompramos || f.cod === atual);
+    CRM.abrirForm({ titulo: 'Fornecedor do produto', intro: (g ? R.nomeDeItem(g.descricao) + ' (' + codigo + ')' : codigo) + '. Vale só no CRM; no FKN o cadastro continua como está.',
+      campos: [{ nome: 'fornecedor', rotulo: 'Fornecedor', tipo: 'select', largo: true, alfa: true, opcoes: [['', g && g.fornecedorTrocado ? '— voltar ao do FKN —' : '—']].concat(todos.map(f => [f.cod, f.nome + ' (' + f.cod + ')'])) }],
+      valores: { fornecedor: (g && g.fornecedorTrocado && g.fornecedorCod) || '' },
+      aoSalvar: async v => { await CRM.store().trocarFornecedor(codigo, v.fornecedor || null); CRM.toast(v.fornecedor ? 'Fornecedor definido.' : 'Volta a valer o fornecedor do FKN.'); estoque = null; CRM.render(); } });
+  }
+
+  function listaTop(l, total) {
+    if (!l.length) return '<p class="vazio">Sem notas no período.</p>';
+    const max = Math.max(1, ...l.map(x => x.valor));
+    return '<ol class="g-top">' + l.map(x => '<li>' + (x.id ? '<button type="button" class="link" data-acao="abrir-empresa" data-id="' + esc(x.id) + '">' + esc(x.nome) + '</button>' : '<span>' + esc(x.nome) + '</span>') +
+      '<span class="num">' + esc(R.moeda(x.valor)) + ' <small>' + (total ? esc(R.pct(x.valor / total * 100)) : '') + '</small></span>' +
+      CRM.barra(x.valor, max) + '<small>' + esc(x.info) + '</small></li>').join('') + '</ol>';
+  }
+  function listaTendencia(l) {
+    if (!l.length) return '<p class="vazio">Nada fora do normal.</p>';
+    return '<ul class="g-tend">' + l.map(g => '<li><span>' + esc(R.nomeDeItem(g.descricao)) + '</span>' + seta(g.tendencia) + '<small>' + qtd(g.qtd90) + ' ' + esc(g.unidade) + ' nos últimos 90 dias</small></li>').join('') + '</ul>';
+  }
+
+  Object.assign(CRM.acoes, {
+    'compras-coluna': id => { if (fc.col === id) fc.dir = fc.dir === 'desc' ? 'asc' : 'desc'; else { fc.col = id; fc.dir = COLUNAS.find(c => c[0] === id)[2] ? 'desc' : 'asc'; } CRM.render(); },
+    // Quadros de Compras: aplicam o filtro na tabela logo abaixo.
+    'compras-kpi': id => {
+      Object.assign(fc, id === 'A' ? { mostrar: 'vendidos', curva: 'A', ordem: 'vendido' } : { mostrar: id, curva: '', ordem: { comprar: 'curva', falta: 'vendido', parado: 'parado' }[id] },
+        { busca: '', fornecedor: '', linha: '', col: null });
+      CRM.render();
+      const t = document.querySelector('.filtros-compras'); if (t && t.scrollIntoView) t.scrollIntoView({ block: 'start' });
+    },
+    // Quadros da Gestão: a lista do que cada número conta.
+    'gestao-lista': id => {
+      if (!ultimo || !ultimo.p || !CRM.mostraLista) return;
+      const p = ultimo.p, m = p.mes, L = p.funil.listas || {};
+      const notas = (titulo, l) => ({ titulo, tipo: 'notas', itens: l, vendedor: n => CRM.nomeUsuario(donoDe(E().ix, n)) + (n.vendedor_nome && !n.vendedor_id ? ' (' + n.vendedor_nome + ', ex-vendedor)' : '') });
+      const desde = R.dataBR(m.de);
+      const f = {
+        mes: () => Object.assign(notas('Notas do mês', m.atual.lista), { sub: desde + ' até hoje' }),
+        'mes-equipe': () => Object.assign(notas('Notas do mês · Equipe de vendas', m.equipe.lista), { sub: desde + ' até hoje · sem o Direto' }),
+        ano: () => Object.assign(notas('Notas do ano', p.ano.lista), { sub: 'de 01/01 até hoje' }),
+        clientes: () => ({ titulo: 'Clientes que compraram no mês', sub: desde + ' até hoje', tipo: 'empresas', itens: [...new Set(m.atual.lista.map(n => n.empresa_id).filter(Boolean))].map(id => CRM.empresa(id)).filter(Boolean) }),
+        abertos: () => ({ titulo: 'Negócios abertos' + (p.funilVendas ? ' · ' + p.funilVendas : ''), tipo: 'negocios', itens: L.abertos || [], data: 'previsao_fechamento' }),
+        decididos: () => ({ titulo: 'Ganhos e perdidos no mês' + (p.funilVendas ? ' · ' + p.funilVendas : ''), tipo: 'negocios', itens: L.decididos || [], data: 'fechado_em' })
+      }[id];
+      if (f) CRM.mostraLista(f());
+    },
+    'compras-ver-fornecedor': i => {
+      const f = ultimo && ultimo.c && ultimo.c.pedidoPorFornecedor[+i];
+      if (!f) return;
+      Object.assign(fc, { fornecedor: f.cod ? f.nome : '-', mostrar: 'comprar', busca: '', curva: '', linha: '', col: null });
+      CRM.render();
+      const t = document.querySelector('.filtros-compras'); if (t && t.scrollIntoView) t.scrollIntoView({ block: 'start' });
+    },
+    'compras-colunas': () => { todasColunas = !todasColunas; try { localStorage.setItem('crm_compras_colunas', todasColunas ? 'todas' : ''); } catch (e) { /* sem armazenamento */ } CRM.render(); },
+    'compras-forn-editar': cod => formFornecedor(cod),
+    'compras-troca-forn': cod => formTrocaForn(cod),
+    'compras-sem-forn': () => {
+      Object.assign(fc, { fornecedor: '-', mostrar: 'vendidos', busca: '', curva: '', linha: '', col: null, ordem: 'vendido' });
+      CRM.render();
+      const t = document.querySelector('.filtros-compras'); if (t && t.scrollIntoView) t.scrollIntoView({ block: 'start' });
+    },
+    'compras-ir-pedido': () => { const s = document.getElementById('comprasPorForn'); if (s && s.scrollIntoView) s.scrollIntoView({ block: 'start', behavior: 'smooth' }); },
+    'compras-analise-gerar': () => { const an = CRM.turma.analise(); CRM.turma.gerarAnalise(!!(an && an.texto)); },
+    'compras-analise': () => CRM.turma && CRM.turma.perguntar && CRM.turma.perguntar('Faça a análise de compras de hoje como comprador sênior: o que pedir e de qual fornecedor (com quantidades e o porquê), ' +
+      'o que acaba antes da entrega, fornecedores perto do pedido mínimo, preço de compra que subiu e o estoque parado que vale uma oferta.'),
+    'compras-registrar': i => {
+      const f = ultimo && ultimo.c && ultimo.c.pedidoPorFornecedor[+i];
+      if (f && CRM.comprasPedidos) CRM.comprasPedidos.registrar(f);
+    },
+    'compras-pedido-fornecedor': i => {
+      const f = ultimo && ultimo.c && ultimo.c.pedidoPorFornecedor[+i];
+      if (!f) return;
+      CRM.baixarCSV('pedido-' + R.normaliza(f.nome).replace(/[^a-z0-9]+/g, '-').slice(0, 40) + '-' + diasCompras + 'dias', ['Código', 'Produto', 'Unidade', 'Comprar', 'Caixas', 'Custo unitário', 'Custo estimado', 'Estoque', 'Já pedido', 'Mínimo FKN'],
+        f.itens.map(g => [g.codigo || '', g.descricao, g.unidade, g.comprar, g.caixas ? g.caixas + ' cx de ' + g.caixa.fator : '', g.custoUnit ? +g.custoUnit.toFixed(2) : '',
+          g.custoUnit ? +(g.custoUnit * g.comprar).toFixed(2) : '', g.saldo, g.pedido || 0, g.minimo || 0]));
+    },
+    'compras-exportar': () => {
+      const l = (ultimo && ultimo.filtrados) || [];
+      CRM.baixarCSV('compras-' + fc.mostrar + '-' + diasCompras + 'dias', ['Código', 'Produto', 'Unidade', 'Fornecedor', 'Linha', 'Família', 'Curva', 'Estoque', 'Mínimo FKN', 'Já pedido', 'Consumo por mês', 'Dura (dias)', 'Clientes previstos', 'Precisa', 'Comprar', 'Caixas', 'Custo unitário', 'Custo do pedido', 'Vendido 12 meses (R$)', 'Tendência %'],
+        l.map(g => [g.codigo || '', g.descricao, g.unidade, g.fornecedor || '', g.linha || '', g.familia || '', g.classe, g.saldo == null ? '' : g.saldo, g.minimo || '', g.pedido || '', g.consumoDia ? +(g.consumoDia * 30).toFixed(2) : '', g.cobertura == null ? '' : Math.round(g.cobertura),
+          g.clientesPrevistos || 0, +(g.necessidade || 0).toFixed(2), g.comprar || 0, g.caixas ? g.caixas + ' cx de ' + g.caixa.fator : '', g.custoUnit ? +g.custoUnit.toFixed(2) : '', g.custoUnit && g.comprar ? +(g.custoUnit * g.comprar).toFixed(2) : '',
+          +(g.valor12 || 0).toFixed(2), g.tendencia == null ? '' : Math.round(g.tendencia)]));
+    },
+    'gestao-exportar': t => {
+      if (!ultimo) return;
+      const c = ultimo.c;
+      if (t === 'demanda') CRM.baixarCSV('compras-demanda-' + c.dias + 'dias', ['Produto', 'Código', 'Unidade', 'Curva', 'Quantidade prevista', 'Clientes', 'Média por mês (90 dias)', 'Tendência %'],
+        c.demanda.map(g => [g.descricao, g.codigo, g.unidade, g.classe, +g.prevista.toFixed(2), g.clientesPrevistos, +g.mediaMensal.toFixed(2), g.tendencia == null ? '' : Math.round(g.tendencia)]));
+      if (t === 'pedido') CRM.baixarCSV('compras-sugestao-pedido-' + c.dias + 'dias', ['Código', 'Produto', 'Unidade', 'Curva', 'Estoque', 'Consumo por mês', 'Dura (dias)', 'Precisa', 'Comprar', 'Custo unitário', 'Custo estimado'],
+        c.sugestao.map(g => [g.codigo, g.descricao, g.unidade, g.classe, g.saldo, +(g.consumoDia * 30).toFixed(2), g.cobertura == null ? '' : Math.round(g.cobertura), +g.necessidade.toFixed(2), g.comprar,
+          g.custoUnit ? +g.custoUnit.toFixed(2) : '', g.custoUnit ? +(g.custoUnit * g.comprar).toFixed(2) : '']));
+      if (t === 'parado') CRM.baixarCSV('compras-estoque-parado', ['Código', 'Produto', 'Unidade', 'Estoque', 'Custo total'],
+        c.parado.map(x => [x.codigo, x.descricao, x.unidade || '', x.quantidade, x.custo_total]));
+      if (t === 'abc') CRM.baixarCSV('compras-curva-abc', ['Produto', 'Código', 'Unidade', 'Curva', 'Faturamento 12 meses', '% acumulado', 'Clientes', 'Quantidade 90 dias'],
+        c.abc.A.concat(c.abc.B, c.abc.C).sort((a, b) => b.valor12 - a.valor12).map(g => [g.descricao, g.codigo, g.unidade, g.classe, +g.valor12.toFixed(2), +g.pctAcumulado.toFixed(1), g.clientes12, +g.qtd90.toFixed(2)]));
+    }
+  });
+})(typeof window !== 'undefined' ? window : globalThis);

@@ -1,0 +1,130 @@
+/* CRM Sistemi Dalessi — leitor mínimo de .xlsx, sem biblioteca externa.
+   Um .xlsx é um ZIP com XML dentro. Lê o diretório central do ZIP, descompacta
+   com o DecompressionStream nativo do navegador ('deflate-raw') e interpreta
+   sharedStrings + a primeira planilha com DOMParser. Datas vêm como número de
+   série do Excel (o importador converte). Só leitura, só valores. */
+(function () {
+  'use strict';
+
+  async function inflar(bytes) {
+    const ds = new DecompressionStream('deflate-raw');
+    const buf = await new Response(new Blob([bytes]).stream().pipeThrough(ds)).arrayBuffer();
+    return new Uint8Array(buf);
+  }
+
+  // ZIP do Windows ("Pasta compactada") com muitos arquivos pode vir no formato estendido (ZIP64): o total
+  // e as posições ficam no registro ZIP64 e no campo extra 0x0001 de cada arquivo (14/10/2026).
+  async function lerZip(buf) {
+    const b = new Uint8Array(buf);
+    const dv = new DataView(buf);
+    const sig = String.fromCharCode.apply(null, b.subarray(0, 4));
+    if (sig === 'Rar!') throw new Error('este arquivo é RAR, não ZIP: compacte de novo como ZIP (botão direito → Enviar para → Pasta compactada) ou escolha a pasta');
+    if (b[0] === 0x37 && b[1] === 0x7a && b[2] === 0xbc && b[3] === 0xaf) throw new Error('este arquivo é 7z, não ZIP: compacte como ZIP ou escolha a pasta');
+    let fim = -1;
+    for (let i = b.length - 22; i >= Math.max(0, b.length - 65557); i--) {
+      if (dv.getUint32(i, true) === 0x06054b50) { fim = i; break; }
+    }
+    if (fim < 0) throw new Error('arquivo não é um .xlsx ou .zip válido');
+    const u64 = o => dv.getUint32(o, true) + dv.getUint32(o + 4, true) * 4294967296;
+    let total = dv.getUint16(fim + 10, true);
+    let p = dv.getUint32(fim + 16, true);
+    if ((total === 0xffff || p === 0xffffffff) && fim >= 20 && dv.getUint32(fim - 20, true) === 0x07064b50) {
+      const e64 = u64(fim - 20 + 8);
+      if (dv.getUint32(e64, true) === 0x06064b50) { total = u64(e64 + 32); p = u64(e64 + 48); }
+    }
+    const arquivos = {};
+    const dec = new TextDecoder();
+    for (let n = 0; n < total; n++) {
+      if (dv.getUint32(p, true) !== 0x02014b50) throw new Error('ZIP corrompido (ou cortado na cópia)');
+      const metodo = dv.getUint16(p + 10, true);
+      let tam = dv.getUint32(p + 20, true);
+      const tamOrig = dv.getUint32(p + 24, true);
+      const lnome = dv.getUint16(p + 28, true), lextra = dv.getUint16(p + 30, true), lcom = dv.getUint16(p + 32, true);
+      let local = dv.getUint32(p + 42, true);
+      if (tam === 0xffffffff || local === 0xffffffff) {
+        // campo extra ZIP64: tamanho original, tamanho comprimido, posição — só os que estão com 0xFFFFFFFF
+        for (let q = p + 46 + lnome, fimx = q + lextra; q + 4 <= fimx;) {
+          const id = dv.getUint16(q, true), lx = dv.getUint16(q + 2, true);
+          if (id === 0x0001) {
+            let r = q + 4;
+            if (tamOrig === 0xffffffff) r += 8;
+            if (tam === 0xffffffff) { tam = u64(r); r += 8; }
+            if (local === 0xffffffff) local = u64(r);
+          }
+          q += 4 + lx;
+        }
+      }
+      const nome = dec.decode(b.subarray(p + 46, p + 46 + lnome));
+      arquivos[nome] = { metodo, tam, local };
+      p += 46 + lnome + lextra + lcom;
+    }
+    return {
+      nomes: Object.keys(arquivos),
+      async texto(nome) {
+        const a = arquivos[nome];
+        if (!a) return null;
+        if (a.metodo !== 0 && a.metodo !== 8) throw new Error('o ZIP usa uma compressão que o navegador não abre (método ' + a.metodo + '): compacte de novo pelo Windows ou escolha a pasta');
+        const ini = a.local + 30 + dv.getUint16(a.local + 26, true) + dv.getUint16(a.local + 28, true);
+        const dados = b.subarray(ini, ini + a.tam);
+        const bytes = a.metodo === 0 ? dados : await inflar(dados);
+        return dec.decode(bytes);
+      }
+    };
+  }
+
+  const xml = t => new DOMParser().parseFromString(t, 'application/xml');
+  const porTag = (el, tag) => Array.from(el.getElementsByTagNameNS('*', tag));
+
+  function colunaIndice(ref) {
+    const m = /^([A-Z]+)/.exec(ref || '');
+    if (!m) return -1;
+    let n = 0;
+    for (const ch of m[1]) n = n * 26 + ch.charCodeAt(0) - 64;
+    return n - 1;
+  }
+
+  // Devolve { abas: [nomes], linhas: [[...]] } da aba pedida (padrão: a primeira).
+  async function lerXlsx(arquivo, qualAba) {
+    const zip = await lerZip(await arquivo.arrayBuffer());
+    const wb = xml(await zip.texto('xl/workbook.xml'));
+    const abas = porTag(wb, 'sheet').map(s => ({ nome: s.getAttribute('name'), rid: s.getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships', 'id') || s.getAttribute('r:id') }));
+    const rels = xml(await zip.texto('xl/_rels/workbook.xml.rels'));
+    const alvo = {};
+    porTag(rels, 'Relationship').forEach(r => { alvo[r.getAttribute('Id')] = r.getAttribute('Target'); });
+    const aba = abas[qualAba || 0] || abas[0];
+    let caminho = alvo[aba.rid] || 'worksheets/sheet1.xml';
+    caminho = caminho.replace(/^\/?xl\//, '').replace(/^\//, '');
+    const compartilhadas = [];
+    const ss = await zip.texto('xl/sharedStrings.xml');
+    if (ss) porTag(xml(ss), 'si').forEach(si => compartilhadas.push(porTag(si, 't').map(t => t.textContent).join('')));
+    const planilha = xml(await zip.texto('xl/' + caminho));
+    const linhas = [];
+    porTag(planilha, 'row').forEach(row => {
+      const linha = [];
+      porTag(row, 'c').forEach(c => {
+        const i = colunaIndice(c.getAttribute('r'));
+        const t = c.getAttribute('t');
+        const v = porTag(c, 'v')[0];
+        let val = '';
+        if (t === 's') val = v ? compartilhadas[+v.textContent] || '' : '';
+        else if (t === 'inlineStr') val = porTag(c, 't').map(x => x.textContent).join('');
+        else if (t === 'b') val = v && v.textContent === '1' ? 'sim' : 'não';
+        else if (v) { const n = Number(v.textContent); val = t === 'str' || t === 'e' || !isFinite(n) ? v.textContent : n; }
+        linha[i >= 0 ? i : linha.length] = val;
+      });
+      for (let i = 0; i < linha.length; i++) if (linha[i] === undefined) linha[i] = '';
+      if (linha.some(x => x !== '' && x != null)) linhas.push(linha);
+    });
+    return { abas: abas.map(a => a.nome), linhas };
+  }
+
+  // Todos os arquivos de um .zip cujo nome casa com o filtro: [{ nome, texto }].
+  async function lerZipTextos(arquivo, filtro) {
+    const zip = await lerZip(await arquivo.arrayBuffer());
+    const out = [];
+    for (const nome of zip.nomes) if (!filtro || filtro.test(nome)) out.push({ nome, texto: await zip.texto(nome) });
+    return out;
+  }
+
+  window.CRMXlsx = { lerXlsx, lerZipTextos };
+})();

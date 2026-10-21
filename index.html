@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- CSP: nada inline (nem <script>, nem onclick=, nem style=). Script externo só o
+     supabase-js do jsDelivr, com SRI (app.js). Imagens: as fotos dos produtos vêm do Storage do Supabase. Conexões: Supabase; links de
+     WhatsApp/Maps/Agenda abrem em outra aba e não precisam estar aqui. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self'; img-src 'self' data: blob: https://*.supabase.co; connect-src 'self' https://*.supabase.co wss://*.supabase.co; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>CRM · demonstração</title>
+<meta name="crm-versao" content="dc346dcd4bca">
+<!-- app no celular (21/10/2026): manifest + sw.js; ícones da instalação em assets/app-*.png (trocar com o logo do cliente) -->
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#0f2340">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="CRM">
+<link rel="apple-touch-icon" href="assets/app-180.png?v=2176b64487">
+<link rel="icon" href="assets/logo.jpg?v=c886df2fc5">
+<link rel="stylesheet" href="crm.css?v=f24707d088">
+<link rel="stylesheet" href="demo.css?v=3daf622f0a">
+</head>
+<body>
+<div id="tela"></div>
+
+<div id="app" class="app" hidden>
+  <header class="barra-topo">
+    <div class="marca"><img id="logoTopo" src="assets/logo.jpg?v=c886df2fc5" alt="" class="logo"><img id="logoMenu" alt="" class="logo-menu" hidden><div><strong id="nomeTopo">CRM</strong><span>CRM</span></div></div>
+    <nav id="menuLateral" class="menu-topo" aria-label="Seções"></nav>
+    <span class="flex"></span>
+    <button type="button" class="btn-atualizar" data-acao="atualizar-pagina" title="Recarregar a página (os dados e a versão mais nova do sistema)">⟳ Atualizar</button>
+    <p class="assinatura">Sistemi Dalessi</p>
+    <button type="button" id="usuarioTopo" class="usuario-topo" data-acao="menu-usuario"></button>
+  </header>
+  <div class="principal">
+    <header class="topo">
+      <nav id="menuArea" class="menu-area" aria-label="Telas desta área"></nav>
+      <div class="busca">
+        <input type="search" id="buscaGlobal" placeholder="Buscar empresa, pessoa, telefone, e-mail, negócio, nº da proposta…  (Ctrl+K)" autocomplete="off" aria-label="Busca">
+        <div id="resultadosBusca" class="resultados-busca" hidden></div>
+      </div>
+      <select id="visao" aria-label="Carteira" title="Ver a equipe toda ou a carteira de um vendedor" hidden></select>
+      <button type="button" class="btn ouro" data-acao="novo-menu">+ Novo</button>
+      <button type="button" id="sino" class="sino" data-acao="sino" aria-label="Alertas"></button>
+    </header>
+    <div id="faixaModo" class="faixa" hidden>Modo local: os dados ficam só neste navegador. Para a equipe usar de qualquer computador, ligue o Supabase (crm/README.md).</div>
+    <div id="faixaCarga" class="faixa" role="status" hidden></div>
+    <div id="faixaVersao" class="faixa" role="status" hidden></div>
+    <div id="faixaVigia" class="faixa alerta" role="alert" hidden></div>
+    <main id="conteudo" class="conteudo"></main>
+  </div>
+</div>
+
+<dialog id="dlgEmpresa" class="dlg ficha-dlg"></dialog>
+<dialog id="dlgNegocio" class="dlg ficha-dlg media"></dialog>
+<dialog id="dlgForm" class="dlg"></dialog>
+<dialog id="dlgLista" class="dlg ficha-dlg media"></dialog>
+<div id="impressao" class="impressao"></div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<script src="config.js?v=45cf352791"></script>
+<script src="regras.js?v=d5825c7446"></script>
+<script src="cadencia.js?v=8905237dde"></script>
+<script src="dados.js?v=17dcfa81af"></script>
+<script src="demo.js?v=43d5ba7443"></script>
+<script src="planilha.js?v=df6eefcaec"></script>
+<script src="nfe.js?v=3b25a30eb9"></script>
+<script src="xlsx-leitor.js?v=f6da9a0815"></script>
+<script src="ui.js?v=f546c23678"></script>
+<script src="app.js?v=2ad80a789a"></script>
+<script src="perfil.js?v=e602731ca7"></script>
+<script src="telas.js?v=5b751ed7c8"></script>
+<script src="fkn.js?v=b6d0d85d5d"></script>
+<script src="gestao.js?v=5bd463de9f"></script>
+<script src="frases.js?v=adc91fb830"></script>
+<script src="caixa-calculo.js?v=9a8446d31f"></script>
+<script src="caixa.js?v=7148df59c3"></script>
+<script src="detalhe.js?v=faea975d82"></script>
+<script src="financeiro.js?v=7d83ba4538"></script>
+<script src="fichas.js?v=4c75bd8d03"></script>
+<script src="danfe.js?v=092510cd9f"></script>
+<script src="cobranca.js?v=d860042c34"></script>
+<script src="orcamento.js?v=238e2e01ff"></script>
+<script src="ajustes.js?v=ed44609a15"></script>
+<script src="emails.js?v=f1c01133d1"></script>
+<script src="fiscal.js?v=70a896e2ed"></script>
+<script src="estoque.js?v=bf10c2cc2c"></script>
+<script src="compras-pedidos.js?v=5c0b5c9e92"></script>
+<script src="pedidos.js?v=e364a309c6"></script>
+<script src="rotas.js?v=14753e1345"></script>
+<script src="produtos.js?v=52121b5ed9"></script>
+<script src="emissao.js?v=074b5b9402"></script>
+<script src="concorrentes.js?v=b4d84108c2"></script>
+<script src="ofertas.js?v=e6acb5ecb2"></script>
+<script src="sequencia.js?v=a18c820267"></script>
+<script src="turma.js?v=8996998d0d"></script>
+</body>
+</html>

@@ -1,0 +1,474 @@
+/* CRM Sistemi Dalessi — notas fiscais (NF-e / NFC-e) importadas do XML.
+   - lerXml(texto): um XML (nfeProc, NFe ou evento de cancelamento) -> documento normalizado;
+   - planeja(D, docs, op): mesmo formato de plano do importador (criar / atualizar / ignorados),
+     ligando cada nota à empresa por CNPJ, razão social ou nome, completando o CNPJ que faltar,
+     criando o cliente que ainda não existe e (opcional) o produto no catálogo.
+   Sem duplicar: a chave de 44 dígitos da nota é única no banco.
+   Puro: sem DOM e sem banco (o XML da NF-e é gerado por máquina e regular; regex basta).
+   Testado em testes/nfe.test.js. */
+(function (raiz) {
+  'use strict';
+  const R = raiz.CRMRegras || (typeof require !== 'undefined' ? require('./regras.js') : null);
+  const uuid = () => (raiz.CRMDados ? raiz.CRMDados.uuid() : require('crypto').randomUUID());
+
+  // ------------------------------------------------------------ leitura do XML
+  const ENT = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+  const desescapa = s => s.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+    .replace(/&(#x[0-9a-f]+|#\d+|\w+);/gi, (m, e) => e[0] !== '#' ? (ENT[e] != null ? ENT[e] : m)
+      : String.fromCodePoint(e[1].toLowerCase() === 'x' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10)));
+  const PREF = '(?:[\\w-]+:)?'; // prefixo de namespace opcional (nfe:, ns0:)
+  function blocos(xml, tag) {
+    const re = new RegExp('<' + PREF + tag + '(\\s[^>]*)?>([\\s\\S]*?)</' + PREF + tag + '>', 'g');
+    const out = [];
+    let m;
+    while ((m = re.exec(xml || ''))) out.push({ attrs: m[1] || '', corpo: m[2] });
+    return out;
+  }
+  const bloco = (xml, tag) => { const b = blocos(xml, tag)[0]; return b ? b.corpo : ''; };
+  function valor(xml, tag) {
+    const m = new RegExp('<' + PREF + tag + '(?:\\s[^>]*)?>([^<]*)</' + PREF + tag + '>').exec(xml || '');
+    return m ? desescapa(m[1]).trim() : '';
+  }
+  const atributo = (attrs, nome) => { const m = new RegExp('\\b' + nome + '="([^"]*)"').exec(attrs || ''); return m ? m[1] : ''; };
+  const numero = v => { const n = Number(v); return isFinite(n) ? n : 0; };
+  const arred = v => Math.round(v * 100) / 100;
+  const tem = (xml, tag) => new RegExp('<' + PREF + tag + '[\\s>]').test(xml);
+
+  // Tributação do item (Fase 1 da saída do FKN, 15/10/2026): CST/CSOSN e alíquotas de ICMS, PIS, COFINS e IPI,
+  // CEST, GTIN e origem — o ponto de partida da regra fiscal de cada produto (crm_fiscal_itens). Vai em
+  // item.fiscal, separado do que é gravado em crm_nota_itens.
+  const numOuNulo = v => (v === '' ? null : numero(v));
+  function fiscalDoItem(det) {
+    const p = bloco(det, 'prod'), imp = bloco(det, 'imposto');
+    const icms = bloco(imp, 'ICMS'), pis = bloco(imp, 'PIS'), cofins = bloco(imp, 'COFINS'), ipi = bloco(imp, 'IPI');
+    const gtin = valor(p, 'cEAN');
+    return {
+      gtin: /^\d{8,14}$/.test(gtin) ? gtin : null, cest: valor(p, 'CEST') || null,
+      origem: valor(icms, 'orig') || null, cst_icms: valor(icms, 'CST') || valor(icms, 'CSOSN') || null,
+      aliq_icms: numOuNulo(valor(icms, 'pICMS')), red_bc_icms: numOuNulo(valor(icms, 'pRedBC')),
+      v_bc_icms: numOuNulo(valor(icms, 'vBC')), v_icms: numOuNulo(valor(icms, 'vICMS')),
+      v_bc_st: numOuNulo(valor(icms, 'vBCST')), v_icms_st: numOuNulo(valor(icms, 'vICMSST')), v_st_ret: numOuNulo(valor(icms, 'vICMSSTRet')),
+      cst_pis: valor(pis, 'CST') || null, aliq_pis: numOuNulo(valor(pis, 'pPIS')), v_pis: numOuNulo(valor(pis, 'vPIS')),
+      cst_cofins: valor(cofins, 'CST') || null, aliq_cofins: numOuNulo(valor(cofins, 'pCOFINS')), v_cofins: numOuNulo(valor(cofins, 'vCOFINS')),
+      cst_ipi: valor(ipi, 'CST') || null, v_ipi: numOuNulo(valor(ipi, 'vIPI'))
+    };
+  }
+
+  // Vendedor: a NF-e não tem campo próprio; os sistemas costumam escrever nas informações
+  // complementares ("Vendedor: 012 - SILMARA") ou num campo livre <obsCont xCampo="Vendedor">.
+  function vendedorNoXml(adic) {
+    const campo = blocos(adic, 'obsCont').find(b => /vend/i.test(atributo(b.attrs, 'xCampo')));
+    let v = campo ? valor(campo.corpo, 'xTexto') : '';
+    if (!v) {
+      const m = /\bvend(?:edor(?:\(a\)|a)?|\.)?\s*[:=]\s*([^|;\n\r]{1,60})/i.exec(valor(adic, 'infCpl'));
+      v = m ? m[1] : '';
+    }
+    v = v.replace(/^\s*\d+\s*[-–]?\s*/, '').split(/\s[-–]\s|\s{2,}|,/)[0].replace(/[.\s]+$/, '').trim();
+    return v && /[a-zà-ú]/i.test(v) ? v.slice(0, 40) : null;
+  }
+
+  function lerXml(texto) {
+    const x = String(texto || '').replace(/^﻿/, '');
+    // Evento de cancelamento: procEventoNFe / evento com tpEvento 110111.
+    if (!tem(x, 'infNFe') && tem(x, 'infEvento')) {
+      if (valor(x, 'tpEvento') !== '110111') return null;
+      const ret = bloco(x, 'retEvento');
+      const st = ret ? valor(bloco(ret, 'infEvento') || ret, 'cStat') : '';
+      if (st && ['135', '136', '155'].indexOf(st) === -1) return null; // evento recusado pela SEFAZ
+      const chave = valor(bloco(x, 'infEvento'), 'chNFe');
+      return /^[0-9A-Z]{44}$/.test(chave) ? { tipo: 'cancelamento', chave } : null;
+    }
+    const inf = blocos(x, 'infNFe')[0];
+    if (!inf) return null;
+    const c = inf.corpo;
+    const prot = bloco(x, 'infProt');
+    const chave = atributo(inf.attrs, 'Id').replace(/^NFe/, '') || valor(prot, 'chNFe');
+    const ide = bloco(c, 'ide'), emit = bloco(c, 'emit'), dest = bloco(c, 'dest');
+    const tot = bloco(bloco(c, 'total'), 'ICMSTot');
+    const end = bloco(dest, 'enderDest');
+    const st = prot ? valor(prot, 'cStat') : '';
+    const dia = valor(ide, 'dEmi');
+    const itens = blocos(c, 'det').map((d, i) => {
+      const p = bloco(d.corpo, 'prod');
+      return {
+        ordem: Number(atributo(d.attrs, 'nItem')) || i + 1,
+        codigo: valor(p, 'cProd') || null, descricao: valor(p, 'xProd') || 'Item', ncm: valor(p, 'NCM') || null,
+        cfop: valor(p, 'CFOP') || null, unidade: valor(p, 'uCom') || null,
+        quantidade: numero(valor(p, 'qCom')), valor_unitario: numero(valor(p, 'vUnCom')),
+        valor_total: arred(numero(valor(p, 'vProd')) - numero(valor(p, 'vDesc'))),
+        fiscal: fiscalDoItem(d.corpo)
+      };
+    });
+    // Parcelas (duplicatas) da cobrança: <cobr><dup><nDup>001</nDup><dVenc>…</dVenc><vDup>…</vDup>.
+    // O FKN numera 001, 002…, e no contas a receber a duplicata é "002527/01" (nota/parcela).
+    const cobr = bloco(c, 'cobr');
+    const parcelas = blocos(cobr, 'dup').map((p, i) => ({ n: Number(String(valor(p.corpo, 'nDup')).replace(/\D/g, '')) || i + 1,
+      vencimento: (valor(p.corpo, 'dVenc') || '').slice(0, 10) || null, valor: numero(valor(p.corpo, 'vDup')) })).filter(p => p.vencimento && p.valor > 0);
+    const pag = bloco(bloco(c, 'pag'), 'detPag');
+    return {
+      tipo: 'nota', chave, modelo: valor(ide, 'mod'), numero: Number(valor(ide, 'nNF')) || null, serie: valor(ide, 'serie') || null,
+      emitida_em: valor(ide, 'dhEmi') || (dia ? dia + 'T12:00:00-03:00' : null),
+      natureza: valor(ide, 'natOp') || null, saida: valor(ide, 'tpNF') !== '0', finalidade: valor(ide, 'finNFe') || '1',
+      autorizada: !prot || st === '100' || st === '150', situacao_sefaz: st,
+      emitente: { doc: R.doc(valor(emit, 'CNPJ') || valor(emit, 'CPF')), nome: valor(emit, 'xNome') },
+      cliente: {
+        doc: R.doc(valor(dest, 'CNPJ') || valor(dest, 'CPF')), nome: valor(dest, 'xNome'), email: valor(dest, 'email'),
+        telefone: valor(end, 'fone'), cep: valor(end, 'CEP'), logradouro: valor(end, 'xLgr'), numero: valor(end, 'nro'),
+        complemento: valor(end, 'xCpl'), bairro: valor(end, 'xBairro'), cidade: valor(end, 'xMun'), uf: valor(end, 'UF'),
+        ie: valor(dest, 'IE'), ind_ie: valor(dest, 'indIEDest'), cmun: valor(end, 'cMun')
+      },
+      vendedor: vendedorNoXml(bloco(c, 'infAdic')),
+      valor_produtos: numero(valor(tot, 'vProd')), valor_total: numero(valor(tot, 'vNF')), itens,
+      parcelas, forma_pagamento: valor(pag, 'tPag') || null
+    };
+  }
+
+  // ------------------------------------------------------------ planejamento
+  // op: { responsavelPadrao, cadastrarProdutos (padrão sim), cnpjEmpresa (padrão: o emitente mais frequente),
+  //       filtro: 'todas' | 'auto' (por nota: vendedor escrito, senão carteira)
+  //               | 'carteira' (só clientes já cadastrados com responsável da equipe)
+  //               | 'vendedores' (só os vendedores escritos na nota que estão em vendedoresIncluidos;
+  //                 sem a lista, os que batem com alguém da equipe) }
+  // ---- cliente parecido sem CNPJ. O Agendor da OneClean quase não tinha CNPJ (1.889 de 1.987
+  // clientes): sem isto, a 1ª nota de um cliente antigo criava um cadastro novo ao lado do que já
+  // existia (01/10/2026: New Aço e outros 38). Palavras comuns e nomes de pessoa não contam.
+  const COMUNS = new Set(('ltda eireli epp sa comercio comercial servicos servico industria industrial cia dos das the and com importacao exportacao ' +
+    'distribuidora distribuicao grupo empresa condominio residencial edificio associacao limpeza produtos sociedade brasil sao paulo santo andre ' +
+    'bernardo campo administradora adm escritorio loja casa clinica centro hospital escola colegio instituto restaurante padaria mercado supermercado ' +
+    'auto posto tecnologia solucoes engenharia construtora consultoria participacoes transportes logistica metalurgica alimentos paula silva santos ' +
+    'maria jose joao ana oliveira souza pereira lima costa ferreira rodrigues almeida novo nova new unidade filial matriz educacao infantil ensino').split(' '));
+  const palavras = s => [...new Set(R.normaliza(s || '').replace(/[^a-z0-9]+/g, ' ').split(' ').filter(t => t.length >= 3 && !/^\d+$/.test(t) && !COMUNS.has(t)))];
+  const EMAIL_GENERICO = /^(gmail|hotmail|yahoo|outlook|uol|bol|terra|icloud|live|msn|ig|globo|r7|zipmail|me|email)\./;
+  const dominios = lista => lista.map(m => String(m || '').trim().toLowerCase().split('@')[1] || '').filter(d => d && !EMAIL_GENERICO.test(d))
+    .map(d => d.split('.')[0]).filter(d => d.length >= 4);
+  // Compara o nome da nota com um cadastro. emails: e-mails do cadastro e das pessoas dele.
+  // forte = dá para ligar sozinho (domínio do e-mail no nome, 2 palavras próprias iguais, ou o
+  // cadastro tem uma palavra própria só, longa, e ela está no nome da nota).
+  function parecida(nomeNota, e, emails) {
+    const tn = new Set(palavras(nomeNota)), te = palavras((e.nome || '') + ' ' + (e.razao_social || ''));
+    const comuns = te.filter(t => tn.has(t)).length;
+    const compacto = R.normaliza(nomeNota || '').replace(/[^a-z0-9]/g, '');
+    const dominio = dominios([e.email].concat(emails || [])).some(d => compacto.includes(d));
+    const unica = comuns === 1 && te.length === 1 && te[0].length >= 5;
+    return { comuns, dominio, nome: comuns >= 2 || (comuns >= 1 && Math.min(te.length, tn.size) === 1), forte: dominio || comuns >= 2 || unica };
+  }
+
+  // Venda ganha num cadastro SEM CNPJ com o mesmo valor (centavo a centavo) e até 3 dias de uma nota
+  // de OUTRO cadastro, com CNPJ: quase sempre o mesmo cliente cadastrado duas vezes (Agendor × nota).
+  // Pega o que nome/telefone/e-mail não pegam ("JK COMERCIAL - JUNIOR" × "JK COMERCIAL E DISTRIBUIDORA
+  // LTDA" em 09/10/2026, e mais 14 na mesma busca). Cadastros do mesmo grupo ficam de fora.
+  // Devolve [{ a: id sem CNPJ, b: id da nota, negocio, nota }].
+  function vendasIguaisNotas(empresas, negocios, notas) {
+    const emp = new Map((empresas || []).map(e => [e.id, e]));
+    const centavos = v => Math.round(R.num(v) * 100);
+    const porValor = new Map();
+    (notas || []).forEach(n => {
+      const b = emp.get(n.empresa_id);
+      if (!b || n.cancelada || !R.chaveDoc(b.cnpj) || centavos(n.valor_total) <= 0) return;
+      const k = centavos(n.valor_total);
+      if (!porValor.has(k)) porValor.set(k, []);
+      porValor.get(k).push(n);
+    });
+    const grupo = x => x.grupo_id || x.id;
+    const out = [];
+    (negocios || []).forEach(g => {
+      const a = emp.get(g.empresa_id);
+      if (!a || g.status !== 'ganho' || !g.fechado_em || R.chaveDoc(a.cnpj)) return;
+      (porValor.get(centavos(g.valor)) || []).forEach(n => {
+        const b = emp.get(n.empresa_id);
+        if (b.id === a.id || grupo(a) === grupo(b)) return;
+        if (Math.abs(R.diasEntre(String(g.fechado_em).slice(0, 10), R.diaLocal(n.emitida_em))) > 3) return;
+        out.push({ a: a.id, b: b.id, negocio: g, nota: n });
+      });
+    });
+    return out;
+  }
+
+  const prefixoDup = numero => String(numero || 0).padStart(6, '0');
+  const PAGAMENTO = { '01': 'DINHEIRO', '02': 'CHEQUE', '03': 'CARTÃO CRÉDITO', '04': 'CARTÃO DÉBITO', '05': 'CRÉDITO LOJA', '15': 'BOLETO',
+    '16': 'DEPÓSITO', '17': 'PIX', '18': 'TRANSFERÊNCIA', '90': 'SEM PAGAMENTO', '99': 'OUTROS' };
+
+  function planeja(D, docs, op) {
+    op = op || {};
+    const texto = v => (v == null || String(v).trim() === '' ? null : String(v).trim());
+    const plano = { criar: { opcoes: [], produtos: [], empresas: [], notas: [], nota_itens: [], titulos: [] }, atualizar: [], contagem: {}, ignorados: [], semResponsavel: [],
+      titulosCancelados: [] };
+    const conta = (t, k) => { plano.contagem[t] = plano.contagem[t] || { criados: 0, atualizados: 0, ignorados: 0 }; plano.contagem[t][k]++; };
+    const resumo = { lidas: 0, novas: 0, valor: 0, foraDoFiltro: 0, valorForaDoFiltro: 0, de: null, ate: null, jaImportadas: 0, canceladas: 0, deOutraEmpresa: 0, entradas: 0,
+      devolucoes: 0, naoAutorizadas: 0, empresasLigadas: 0, empresasNovas: 0, cnpjsCompletados: 0, produtosNovos: 0, emitente: null };
+    plano.resumoNotas = resumo;
+    const ignora = (d, motivo) => {
+      conta('notas', 'ignorados');
+      plano.ignorados.push({ tipo: 'notas', linha: d.numero || '', motivo, registro: { chave: d.chave, numero: d.numero, emitida_em: d.emitida_em, cliente: d.cliente && d.cliente.nome } });
+    };
+
+    const notas = [], cancelar = new Set(), vistas = new Set();
+    (docs || []).forEach(d => {
+      if (!d) return;
+      if (d.tipo === 'cancelamento') { cancelar.add(d.chave); return; }
+      if (d.tipo !== 'nota' || !/^[0-9A-Z]{44}$/.test(d.chave || '') || vistas.has(d.chave)) return;
+      vistas.add(d.chave); notas.push(d);
+    });
+    resumo.lidas = notas.length;
+
+    // Emitente = a própria empresa (o CNPJ que mais aparece como emitente nas notas de saída).
+    const freq = new Map();
+    notas.filter(d => d.saida && d.emitente.doc).forEach(d => freq.set(d.emitente.doc, (freq.get(d.emitente.doc) || 0) + 1));
+    const principal = R.doc(op.cnpjEmpresa) || [...freq.entries()].sort((a, b) => b[1] - a[1]).map(x => x[0])[0] || null;
+    if (principal) { const d = notas.find(n => n.emitente.doc === principal); resumo.emitente = { doc: R.formataCNPJ(principal), nome: d ? d.emitente.nome : '' }; }
+
+    // Notas já no banco: não duplica; cancelamento novo só marca.
+    const existentes = new Map((D.notas || []).map(n => [n.chave, n]));
+    cancelar.forEach(ch => {
+      const ex = existentes.get(ch);
+      if (ex && !ex.cancelada) { plano.atualizar.push({ tabela: 'notas', id: ex.id, patch: { cancelada: true } }); conta('notas', 'atualizados'); resumo.canceladas++; }
+      // Nota cancelada: os títulos que vieram dela saem (prefixo da duplicata; o nNF está na chave).
+      plano.titulosCancelados.push(prefixoDup(Number(ch.slice(25, 34))));
+    });
+
+    // ---- vendedor da nota -> usuário do CRM (nome completo ou primeiro nome, se só um tiver)
+    const equipe = (D.usuarios || []).filter(u => u.ativo !== false);
+    const time = new Set(equipe.map(u => u.user_id));
+    const primeiro = n => R.normaliza(n).split(/\s+/)[0];
+    const usuarioDoVendedor = nome => {
+      if (!nome) return null;
+      const k = R.normaliza(nome).replace(/\s+/g, ' ');
+      // "Nome na nota" do usuário (ex.: DIRETO = o dono, que vende direto) vale primeiro.
+      return equipe.find(u => (u.nomes_nota || []).some(x => R.normaliza(x).replace(/\s+/g, ' ') === k)) ||
+        equipe.find(u => R.normaliza(u.nome).replace(/\s+/g, ' ') === k) ||
+        (equipe.filter(u => primeiro(u.nome) === primeiro(nome)).length === 1 ? equipe.find(u => primeiro(u.nome) === primeiro(nome)) : null);
+    };
+    const chaveVend = d => d.vendedor ? R.normaliza(d.vendedor).replace(/\s+/g, ' ') : '';
+    const vendedores = new Map();
+    notas.forEach(d => {
+      const k = chaveVend(d);
+      const v = vendedores.get(k) || { chave: k, nome: d.vendedor || '(nota sem vendedor escrito)', qtd: 0, valor: 0, usuario: k ? usuarioDoVendedor(d.vendedor) : null };
+      v.qtd++; v.valor += d.valor_total; vendedores.set(k, v);
+    });
+    plano.vendedoresNotas = [...vendedores.values()].sort((a, b) => b.valor - a.valor)
+      .map(v => ({ chave: v.chave, nome: v.nome, qtd: v.qtd, valor: Math.round(v.valor * 100) / 100, usuario_id: v.usuario ? v.usuario.user_id : null, usuario_nome: v.usuario ? v.usuario.nome : null }));
+    const filtro = op.filtro || 'todas';
+    // Ex-vendedores (Configurações → Geral): as notas deles entram (contam no faturamento e em
+    // Compras) sem dono — não vão para a carteira nem para o histórico de ninguém.
+    const antigos = new Set([].concat(op.exVendedores || []).map(x => R.normaliza(String(x)).replace(/\s+/g, ' ').trim()).filter(Boolean));
+    plano.vendedoresNotas.forEach(v => { if (!v.usuario_id && antigos.has(v.chave)) v.antigo = true; });
+    const incluidos = new Set(op.vendedoresIncluidos || plano.vendedoresNotas.filter(v => v.usuario_id || v.antigo).map(v => v.chave));
+    plano.vendedoresIncluidos = [...incluidos];
+
+    // ---- empresas: por CNPJ/CPF, razão social, nome e nome antes do " | " (o Agendor da OneClean usa "Empresa | Contato").
+    const porDoc = new Map(), porNome = new Map(), porRaiz = new Map(), porId = new Map();
+    const guarda = (m, k, e) => { if (k && !m.has(k)) m.set(k, e); };
+    const indexaEmpresa = e => {
+      porId.set(e.id, e);
+      const d = R.chaveDoc(e.cnpj); if (d) guarda(porDoc, d, e);
+      if (R.ehCNPJ(d)) guarda(porRaiz, d.slice(0, 8), e);
+      [e.razao_social, e.nome, e.nome && e.nome.indexOf('|') > 0 ? e.nome.split('|')[0] : null].forEach(n => guarda(porNome, R.chaveNome(n), e));
+    };
+    (D.empresas || []).forEach(indexaEmpresa);
+    const novas = new Set(), ligadas = new Set(), patches = new Map();
+    // Dono de cada CNPJ, telefone e e-mail já cadastrado: dado que é de outra empresa não entra
+    // (a trava de duplicado do banco recusaria o cadastro inteiro).
+    const dono = new Map();
+    const marcaDono = e => {
+      [R.chaveDoc(e.cnpj) && 'd' + R.chaveDoc(e.cnpj), R.chaveTelefone(e.telefone) && 't' + R.chaveTelefone(e.telefone),
+        R.chaveTelefone(e.whatsapp) && 't' + R.chaveTelefone(e.whatsapp), R.chaveEmail(e.email) && 'm' + R.chaveEmail(e.email)]
+        .forEach(k => { if (k && !dono.has(k)) dono.set(k, e.id); });
+    };
+    (D.empresas || []).forEach(marcaDono);
+    const livre = (e, k) => !k || !dono.has(k) || dono.get(k) === e.id;
+    resumo.camposCompletados = 0; resumo.dadosDeOutroCadastro = 0;
+    const completa = (e, campos) => {
+      if (novas.has(e.id)) { Object.keys(campos).forEach(k => { if (e[k] == null || e[k] === '') e[k] = campos[k]; }); return; }
+      const p = patches.get(e.id) || {};
+      Object.keys(campos).forEach(k => { const v = campos[k]; if (v != null && v !== '' && (e[k] == null || e[k] === '') && p[k] == null) p[k] = v; });
+      patches.set(e.id, p);
+    };
+    const segmentos = new Set((D.opcoes || []).filter(o => o.tipo === 'segmento').map(o => o.nome));
+    const achaEmpresa = d => {
+      const doc = d.cliente.doc;
+      if (doc.length === 11 || doc.length === 14) { const e = porDoc.get(doc); if (e) return e; }
+      const e = porNome.get(R.chaveNome(d.cliente.nome)) || null;
+      // Mesmo nome com outro CNPJ: é outra unidade (filial) ou outra empresa, nunca a mesma.
+      if (e && doc.length === 14) {
+        const dele = R.chaveDoc(e.cnpj || (patches.get(e.id) || {}).cnpj);
+        if (R.ehCNPJ(dele) && dele !== doc) return null;
+      }
+      return e;
+    };
+    // Matriz/filial: mesmos 8 primeiros dígitos do CNPJ. Devolve o principal do grupo.
+    const principalDaRaiz = d => {
+      if (d.cliente.doc.length !== 14) return null;
+      const m = porRaiz.get(d.cliente.doc.slice(0, 8));
+      return m ? (m.grupo_id && porId.get(m.grupo_id)) || m : null;
+    };
+    // Sem CNPJ nem nome igual: o cliente da mesmo(a) vendedor(a), sem CNPJ, que se parece com o da
+    // nota — só se for UM (dois parecidos = não arrisca; cria e aparece em Duplicados).
+    const emailsDe = new Map();
+    (D.contatos || []).forEach(c => { if (c.email) { const l = emailsDe.get(c.empresa_id) || []; l.push(c.email); emailsDe.set(c.empresa_id, l); } });
+    plano.ligadasPorNome = [];
+    const semCnpj = e => !R.chaveDoc(e.cnpj) && !(patches.get(e.id) || {}).cnpj && !novas.has(e.id);
+    function parecidaDaNota(d, responsavel) {
+      if (!responsavel || !d.cliente.nome) return null;
+      const achadas = (D.empresas || []).filter(e => e.responsavel_id === responsavel && semCnpj(e) && parecida(d.cliente.nome, e, emailsDe.get(e.id)).forte);
+      return achadas.length === 1 ? achadas[0] : null;
+    }
+    function empresaDaNota(d, responsavel) {
+      const c = d.cliente, doc = c.doc;
+      let e = achaEmpresa(d);
+      let porParecida = false;
+      const matriz = e ? null : principalDaRaiz(d);
+      if (!e && !matriz) { e = parecidaDaNota(d, responsavel); porParecida = !!e; }
+      if (e) {
+        if (novas.has(e.id)) { completa(e, { cnpj: doc ? R.formataCNPJ(doc) : null }); return e; }
+        if (!ligadas.has(e.id)) { ligadas.add(e.id); resumo.empresasLigadas++; }
+        const tinhaCnpj = !!(patches.get(e.id) || {}).cnpj;
+        // Completa o cadastro com o que a nota traz (só o que está vazio): documento, razão social,
+        // e-mail, telefone e endereço (o endereço inteiro só se a empresa não tiver nenhum).
+        const campos = { razao_social: texto(c.nome) };
+        const oferece = (campo, valor, chave) => {
+          if (!valor) return;
+          if (!livre(e, chave)) { resumo.dadosDeOutroCadastro++; return; }
+          campos[campo] = valor;
+        };
+        oferece('cnpj', doc ? R.formataCNPJ(doc) : null, R.chaveDoc(doc) && 'd' + R.chaveDoc(doc));
+        oferece('email', texto(c.email) && c.email.trim().toLowerCase(), R.chaveEmail(c.email) && 'm' + R.chaveEmail(c.email));
+        if (!e.telefone && !e.whatsapp) oferece('telefone', texto(c.telefone), R.chaveTelefone(c.telefone) && 't' + R.chaveTelefone(c.telefone));
+        if (!e.cep && !e.logradouro) Object.assign(campos, { cep: texto(c.cep), logradouro: texto(c.logradouro), numero: texto(c.numero), complemento: texto(c.complemento), bairro: texto(c.bairro) });
+        Object.assign(campos, { cidade: texto(c.cidade), uf: texto(c.uf) && c.uf.toUpperCase() });
+        const antes = Object.keys(patches.get(e.id) || {}).length;
+        completa(e, campos);
+        const p = patches.get(e.id) || {};
+        resumo.camposCompletados += Object.keys(p).length - antes;
+        marcaDono(Object.assign({ id: e.id }, p));
+        if (!tinhaCnpj && p.cnpj) { resumo.cnpjsCompletados++; porDoc.set(doc, e); }
+        // Ligada por parecida: a razão social da nota é a oficial (a do Agendor era só um nome).
+        if (porParecida) {
+          if (texto(c.nome) && texto(c.nome) !== e.razao_social) { const q = patches.get(e.id) || {}; q.razao_social = texto(c.nome); patches.set(e.id, q); }
+          plano.ligadasPorNome.push({ nota: d.numero, cliente: texto(c.nome), empresa_id: e.id, empresa: e.nome });
+          resumo.ligadasPorNome = (resumo.ligadasPorNome || 0) + 1;
+        }
+        if (e.situacao !== 'cliente') { const p = patches.get(e.id) || {}; p.situacao = 'cliente'; patches.set(e.id, p); }
+        return e;
+      }
+      const segmento = R.sugereSegmento(c.nome);
+      if (segmento && !segmentos.has(segmento)) {
+        segmentos.add(segmento);
+        plano.criar.opcoes.push({ id: uuid(), tipo: 'segmento', nome: segmento, ordem: R.NOMES_SEGMENTO.indexOf(segmento) + 1 });
+        conta('opcoes', 'criados');
+      }
+      const idNovo = uuid();
+      const seLivre = (v, k) => (livre({ id: idNovo }, k) ? v : null);
+      // Filial de cliente que já existe: cadastro próprio, ligado ao grupo e na mesma carteira.
+      const nomeFilial = matriz && texto(c.nome) ? texto(c.nome) + ' (' + (texto(c.cidade) || 'filial ' + doc.slice(8, 12)) + ')' : null;
+      e = {
+        id: idNovo, nome: nomeFilial || texto(c.nome) || 'Cliente sem nome (NF ' + (d.numero || '') + ')', razao_social: texto(c.nome), cnpj: doc ? R.formataCNPJ(doc) : null,
+        grupo_id: matriz ? matriz.id : null,
+        email: seLivre(texto(c.email) && c.email.trim().toLowerCase(), R.chaveEmail(c.email) && 'm' + R.chaveEmail(c.email)),
+        telefone: seLivre(texto(c.telefone), R.chaveTelefone(c.telefone) && 't' + R.chaveTelefone(c.telefone)), cep: texto(c.cep), logradouro: texto(c.logradouro),
+        numero: texto(c.numero), complemento: texto(c.complemento), bairro: texto(c.bairro), cidade: texto(c.cidade), uf: texto(c.uf) && c.uf.toUpperCase(),
+        situacao: 'cliente', qualificacao: 0, tags: [], segmento: segmento || (matriz && matriz.segmento) || null,
+        responsavel_id: responsavel || (matriz && matriz.responsavel_id) || op.responsavelPadrao || null,
+        criado_em: d.emitida_em ? new Date(d.emitida_em).toISOString() : undefined
+      };
+      Object.keys(e).forEach(k => { if (e[k] == null || e[k] === undefined) delete e[k]; });
+      plano.criar.empresas.push(e); novas.add(e.id); indexaEmpresa(e); marcaDono(e); conta('empresas', 'criados'); resumo.empresasNovas++;
+      if (matriz) resumo.filiaisNovas = (resumo.filiaisNovas || 0) + 1;
+      return e;
+    }
+
+    // ---- produtos do catálogo: por código e por nome
+    const cadastrar = op.cadastrarProdutos !== false;
+    const prodCod = new Map(), prodNome = new Map();
+    const indexaProduto = p => { if (p.codigo) guarda(prodCod, R.normaliza(p.codigo), p); guarda(prodNome, R.normaliza(p.nome), p); };
+    (D.produtos || []).forEach(indexaProduto);
+    function produtoDo(it) {
+      const p = (it.codigo && prodCod.get(R.normaliza(it.codigo))) || prodNome.get(R.normaliza(it.descricao));
+      if (p || !cadastrar || !R.cfopDeVenda(it.cfop)) return p || null;
+      const novo = { id: uuid(), nome: it.descricao, codigo: it.codigo || null, unidade: it.unidade || null, preco: Math.max(0, Math.round(it.valor_unitario * 100) / 100), ativo: true };
+      Object.keys(novo).forEach(k => { if (novo[k] == null) delete novo[k]; });
+      plano.criar.produtos.push(novo); indexaProduto(novo); conta('produtos', 'criados'); resumo.produtosNovos++;
+      return novo;
+    }
+
+    notas.slice().sort((a, b) => String(a.emitida_em).localeCompare(String(b.emitida_em))).forEach(d => {
+      if (existentes.has(d.chave)) {
+        resumo.jaImportadas++; conta('notas', 'ignorados');
+        // Nota antiga sem o vendedor gravado (de antes de 01/10/2026): completa.
+        const ex = existentes.get(d.chave), v = vendedores.get(chaveVend(d));
+        if (d.vendedor && ex.id && !ex.vendedor_nome) {
+          plano.atualizar.push({ tabela: 'notas', id: ex.id, patch: { vendedor_nome: texto(d.vendedor), vendedor_id: v && v.usuario ? v.usuario.user_id : null } });
+          resumo.vendedoresCompletados = (resumo.vendedoresCompletados || 0) + 1;
+        }
+        return;
+      }
+      if (!d.saida) { resumo.entradas++; return ignora(d, 'nota de entrada (compra)'); }
+      if (principal && d.emitente.doc !== principal) { resumo.deOutraEmpresa++; return ignora(d, 'emitida por outra empresa (' + (d.emitente.nome || R.formataCNPJ(d.emitente.doc)) + ')'); }
+      if (d.finalidade === '4') { resumo.devolucoes++; return ignora(d, 'nota de devolução'); }
+      if (!d.autorizada) { resumo.naoAutorizadas++; return ignora(d, 'não autorizada pela SEFAZ (situação ' + d.situacao_sefaz + ')'); }
+      if (!d.emitida_em || isNaN(new Date(d.emitida_em))) return ignora(d, 'sem data de emissão');
+      const vend = vendedores.get(chaveVend(d));
+      const fora = motivo => { resumo.foraDoFiltro++; resumo.valorForaDoFiltro += d.valor_total; return ignora(d, motivo); };
+      // 'auto' (o vigia da pasta de XML usa): nota com vendedor escrito vale pelo vendedor; sem, pela carteira.
+      const modo = filtro === 'auto' ? (d.vendedor ? 'vendedores' : 'carteira') : filtro;
+      if (modo === 'vendedores' && !incluidos.has(chaveVend(d))) return fora(d.vendedor ? 'vendedor(a) ' + d.vendedor + ' não marcado(a)' : 'nota sem vendedor escrito');
+      if (modo === 'carteira') { const ex = achaEmpresa(d) || principalDaRaiz(d); if (!ex || !time.has(ex.responsavel_id)) return fora('cliente fora da carteira da equipe'); }
+      const e = empresaDaNota(d, vend && vend.usuario ? vend.usuario.user_id : null);
+      const cancelada = cancelar.has(d.chave);
+      const n = {
+        id: uuid(), chave: d.chave, numero: d.numero, serie: d.serie, emitida_em: new Date(d.emitida_em).toISOString(), empresa_id: e ? e.id : null,
+        cliente_doc: d.cliente.doc ? R.formataCNPJ(d.cliente.doc) : null, cliente_nome: texto(d.cliente.nome), cidade: texto(d.cliente.cidade),
+        uf: texto(d.cliente.uf), natureza: d.natureza, valor_produtos: d.valor_produtos, valor_total: d.valor_total, cancelada,
+        vendedor_nome: texto(d.vendedor), vendedor_id: vend && vend.usuario ? vend.usuario.user_id : null
+      };
+      Object.keys(n).forEach(k => { if (n[k] == null) delete n[k]; });
+      plano.criar.notas.push(n); conta('notas', 'criados'); resumo.novas++;
+      if (cancelada) resumo.canceladas++;
+      else {
+        resumo.valor += d.valor_total;
+        const dia = R.diaLocal(n.emitida_em);
+        if (!resumo.de || dia < resumo.de) resumo.de = dia;
+        if (!resumo.ate || dia > resumo.ate) resumo.ate = dia;
+      }
+      // Títulos (contas a receber) das parcelas da nota: entram já ao emitir; a listagem do FKN
+      // confirma depois e tira o que foi pago. Só nota de venda, não cancelada.
+      if (!cancelada && (d.parcelas || []).length && d.itens.some(it => R.cfopDeVenda(it.cfop))) {
+        d.parcelas.forEach(pc => {
+          plano.criar.titulos.push({ duplicata: prefixoDup(d.numero) + '/' + String(pc.n).padStart(2, '0'), nota_numero: d.numero, parcela: pc.n,
+            empresa_id: n.empresa_id || null, cliente_doc: d.cliente.doc || null, cliente_nome: texto(d.cliente.nome), vendedor_nome: texto(d.vendedor),
+            emitida_em: R.diaLocal(n.emitida_em), vencimento: pc.vencimento, valor: pc.valor, portador: PAGAMENTO[d.forma_pagamento] || null, origem: 'nota' });
+          conta('titulos', 'criados');
+        });
+        resumo.titulosNovos = (resumo.titulosNovos || 0) + d.parcelas.length;
+      }
+      d.itens.forEach(it => {
+        const p = produtoDo(it);
+        const item = Object.assign({ id: uuid(), nota_id: n.id, produto_id: p ? p.id : null }, it);
+        delete item.fiscal; // vai para crm_fiscal_itens (loteFiscal), não para crm_nota_itens
+        Object.keys(item).forEach(k => { if (item[k] == null) delete item[k]; });
+        plano.criar.nota_itens.push(item); conta('nota_itens', 'criados');
+      });
+    });
+
+    patches.forEach((patch, id) => {
+      if (!Object.keys(patch).length) return;
+      plano.atualizar.push({ tabela: 'empresas', id, patch }); conta('empresas', 'atualizados');
+    });
+    resumo.valor = Math.round(resumo.valor * 100) / 100;
+    resumo.valorForaDoFiltro = Math.round(resumo.valorForaDoFiltro * 100) / 100;
+    return plano;
+  }
+
+  // Lote para public.crm_fiscal_grava: só notas autorizadas (o banco acha cada item pela chave e pela ordem).
+  function loteFiscal(docs) {
+    return (docs || []).filter(d => d && d.tipo === 'nota' && d.autorizada && d.itens && d.itens.length).map(d => ({
+      chave: d.chave,
+      dest: { ie: d.cliente.ie || '', ind_ie: d.cliente.ind_ie || '', cmun: d.cliente.cmun || '', cep: d.cliente.cep || '', logradouro: d.cliente.logradouro || '',
+        numero: d.cliente.numero || '', complemento: d.cliente.complemento || '', bairro: d.cliente.bairro || '', cidade: d.cliente.cidade || '', uf: d.cliente.uf || '' },
+      itens: d.itens.map(it => Object.assign({ ordem: it.ordem, codigo: it.codigo, ncm: it.ncm, cfop: it.cfop }, it.fiscal || {}))
+    }));
+  }
+
+  const api = { lerXml, planeja, parecida, palavras, vendasIguaisNotas, loteFiscal };
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  else raiz.CRMNfe = api;
+})(typeof window !== 'undefined' ? window : globalThis);
